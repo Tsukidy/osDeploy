@@ -103,6 +103,22 @@ BeforeAll {
         [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Nested\sub\inner.exe'), 'dummy')
         return $treeRoot
     }
+
+    # Task 23: EZT registry-store fixture. The documented injectable
+    # registry interface is a hashtable of registry path strings ->
+    # hashtables of value name -> value. New-EztRegistry returns the
+    # deployed EZT Winlogon state: persistent automatic sign-on for the
+    # passwordless User account (Q16/Q24).
+    $script:EztWinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    function New-EztRegistry {
+        $store = @{}
+        $store[$script:EztWinlogonPath] = @{
+            DefaultUserName = 'User'
+            DefaultPassword = ''
+            AutoAdminLogon  = '1'
+        }
+        return $store
+    }
 }
 AfterAll {
     # Release the single-instance lock exactly as the brief prescribes so no
@@ -1423,5 +1439,266 @@ Describe 'Invoke-ApplicationPhase execution, retries, and the Q26 acknowledgemen
         Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 1 -ParameterFilter {
             $FilePath -eq $rooted
         } -Scope It
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Task 23: EZT workflow specifics (Q14/Q15/Q16/Q18/Q19/Q24/Q86)
+# ---------------------------------------------------------------------------
+
+Describe 'New-EztUnattend registry-sync automatic sign-on fragment (Q14/Q16/Q18)' {
+    It 'returns a parseable unattend XML document with the three passes' {
+        $xml = New-EztUnattend -Edition 'Pro' -TimeZone 'China Standard Time'
+        $xml | Should -BeOfType [string]
+        $doc = [xml]$xml
+        $doc.DocumentElement.LocalName | Should -Be 'unattend'
+        (@($doc.GetElementsByTagName('settings') | ForEach-Object { $_.pass }) -join ',') | Should -Be 'windowsPE,specialize,oobeSystem'
+    }
+    It 'syncs the three Winlogon values for the passwordless User through reg add commands' {
+        $doc = [xml](New-EztUnattend -Edition 'Pro' -TimeZone 'China Standard Time')
+        $paths = @($doc.GetElementsByTagName('Path') | ForEach-Object { $_.InnerText })
+        @($paths).Count | Should -Be 3
+        foreach ($p in $paths) {
+            $p | Should -BeLike '*HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon*'
+        }
+        $userCmd = @($paths | Where-Object { $_ -match '/v DefaultUserName' })
+        $userCmd.Count | Should -Be 1
+        $userCmd[0] | Should -BeLike '* /d "User" /f*'
+        $pwCmd = @($paths | Where-Object { $_ -match '/v DefaultPassword' })
+        $pwCmd.Count | Should -Be 1
+        $pwCmd[0] | Should -BeLike '* /d "" /f*'
+        $autoCmd = @($paths | Where-Object { $_ -match '/v AutoAdminLogon' })
+        $autoCmd.Count | Should -Be 1
+        $autoCmd[0] | Should -BeLike '* /d "1" /f*'
+    }
+    It 'contains no AutoLogonCount element or text anywhere (Q16: unlimited sign-in)' {
+        $xml = New-EztUnattend -Edition 'Pro' -TimeZone 'China Standard Time'
+        $doc = [xml]$xml
+        @($doc.GetElementsByTagName('AutoLogonCount')).Count | Should -Be 0
+        $xml | Should -Not -Match '(?i)autologoncount'
+    }
+    It 'contains no product-key element, field, or key-shaped material anywhere (Q18)' {
+        $xml = New-EztUnattend -Edition 'Pro' -TimeZone 'China Standard Time'
+        $doc = [xml]$xml
+        @($doc.GetElementsByTagName('ProductKey')).Count | Should -Be 0
+        $xml | Should -Not -Match '(?i)productkey'
+        $xml | Should -Not -Match '[A-Z0-9]{5}(-[A-Z0-9]{5}){4}'
+        # UserData is the element a product key would live under: it
+        # carries only the EULA acceptance.
+        $userData = @($doc.GetElementsByTagName('UserData'))
+        $userData.Count | Should -Be 1
+        (@($userData[0].ChildNodes | ForEach-Object { $_.LocalName }) -join ',') | Should -Be 'AcceptEula'
+    }
+    It 'consumes Edition as the image-name metadata value and TimeZone as the Shell-Setup time zone' {
+        $doc = [xml](New-EztUnattend -Edition 'Pro' -TimeZone 'China Standard Time')
+        $values = @($doc.GetElementsByTagName('Value') | ForEach-Object { $_.InnerText })
+        $values -contains 'Windows 11 Pro' | Should -BeTrue
+        $tz = @($doc.GetElementsByTagName('TimeZone'))
+        $tz.Count | Should -Be 1
+        $tz[0].InnerText | Should -Be 'China Standard Time'
+    }
+}
+
+Describe 'Invoke-EztAccountPhase account plan (Q14/Q15/Q24)' {
+    It 'creates the passwordless User and adds Administrators membership (Q14/Q15)' {
+        $plan = Invoke-EztAccountPhase
+        $steps = @($plan.Steps)
+        $create = @($steps | Where-Object { $_.Action -eq 'CreateUser' })
+        $create.Count | Should -Be 1
+        $create[0].Name | Should -Be 'User'
+        $create[0].Passwordless | Should -BeTrue
+        $create[0].Password | Should -BeNullOrEmpty
+        $group = @($steps | Where-Object { $_.Action -eq 'AddGroupMember' })
+        $group.Count | Should -Be 1
+        $group[0].Name | Should -Be 'User'
+        $group[0].Group | Should -Be 'Administrators'
+    }
+    It 'keeps the built-in Administrator disabled: one idempotent disable step, no enable action anywhere (Q24)' {
+        $plan = Invoke-EztAccountPhase
+        $actions = @($plan.Steps | ForEach-Object { $_.Action })
+        ($actions -join ',') | Should -Be 'CreateUser,AddGroupMember,EnsureUserDisabled,CreateShortcut'
+        @($plan.Steps | Where-Object { $_.Action -match 'Enable' }).Count | Should -Be 0
+        # The serialized plan text carries no enable token at all.
+        ($plan | ConvertTo-Json -Depth 6) | Should -Not -Match '(?i)enable'
+        $disable = @($plan.Steps | Where-Object { $_.Action -eq 'EnsureUserDisabled' })
+        $disable.Count | Should -Be 1
+        $disable[0].Name | Should -Be 'Administrator'
+    }
+    It 'creates the public-desktop shortcut targeting the managed workflow, never ms-settings:signinoptions (Q15)' {
+        $plan = Invoke-EztAccountPhase
+        $shortcut = @($plan.Steps | Where-Object { $_.Action -eq 'CreateShortcut' })
+        $shortcut.Count | Should -Be 1
+        $shortcut[0].Name | Should -Be 'Set or Change Your Password'
+        $shortcut[0].Directory | Should -Be 'C:\Users\Public\Desktop'
+        $shortcut[0].Target | Should -Not -Match '(?i)ms-settings:signinoptions'
+        $shortcut[0].TargetKind | Should -Be 'ManagedWorkflow'
+        $shortcut[0].Target | Should -Be 'C:\ProgramData\OSDeploy\Set-OwnerPassword.ps1'
+    }
+    It 'default Runner records every step with no side effects and the result carries exactly the two keys' {
+        $plan = Invoke-EztAccountPhase
+        @($plan.Executed).Count | Should -Be 4
+        (@($plan.Executed | ForEach-Object { $_.Action }) -join ',') | Should -Be (@($plan.Steps | ForEach-Object { $_.Action }) -join ',')
+        (@($plan.Keys | Sort-Object) -join ',') | Should -Be 'Executed,Steps'
+    }
+    It 'executes each step through an injected Runner in plan order' {
+        $script:ranActions = @()
+        $plan = Invoke-EztAccountPhase -Runner {
+            param($Step)
+            $script:ranActions += $Step.Action
+            return $true
+        }
+        ($script:ranActions -join ',') | Should -Be 'CreateUser,AddGroupMember,EnsureUserDisabled,CreateShortcut'
+        @($plan.Executed).Count | Should -Be 4
+    }
+    It 'seeds the persistent Winlogon automatic sign-on values through the registry store fixture (Q16/Q24)' {
+        $reg = @{}
+        $null = Invoke-EztAccountPhase -Registry $reg
+        $winlogon = $reg[$script:EztWinlogonPath]
+        $winlogon['DefaultUserName'] | Should -Be 'User'
+        $winlogon['DefaultPassword'] | Should -Be ''
+        $winlogon['AutoAdminLogon'] | Should -Be '1'
+        $winlogon.Contains('AutoLogonCount') | Should -BeFalse
+    }
+    It 'a throwing Runner propagates and the registry fixture stays untouched (fail closed)' {
+        $reg = @{}
+        { Invoke-EztAccountPhase -Runner { param($Step) throw 'account subsystem offline' } -Registry $reg } | Should -Throw
+        $reg.Contains($script:EztWinlogonPath) | Should -BeFalse
+        @($reg.Keys).Count | Should -Be 0
+    }
+    It 'a Runner returning $false fails the phase before any registry seeding (module failure convention)' {
+        $reg = @{}
+        $runner = {
+            param($Step)
+            if ($Step.Action -eq 'AddGroupMember') { return $false }
+            return $true
+        }
+        { Invoke-EztAccountPhase -Runner $runner -Registry $reg } | Should -Throw
+        $reg.Contains($script:EztWinlogonPath) | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-PasswordTransition one controlled transition (Q86)' {
+    It 'applies the four steps in order and lands the registry end state' {
+        $reg = New-EztRegistry
+        $script:setCalls = 0
+        $script:received = $null
+        $setPassword = {
+            param([string]$NewPassword)
+            $script:setCalls++
+            $script:received = $NewPassword
+            return $true
+        }
+        $r = Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword $setPassword -Registry $reg
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'AppliedSteps'
+        ($r.AppliedSteps -join ',') | Should -Be 'Warn,SetPassword,DisableAutoLogon,ClearCredential'
+        $script:setCalls | Should -Be 1
+        $script:received | Should -Be 'Owner-Pass-1'
+        $winlogon = $reg[$script:EztWinlogonPath]
+        $winlogon['AutoAdminLogon'] | Should -Be '0'
+        $winlogon.Contains('DefaultPassword') | Should -BeFalse
+        $winlogon['DefaultUserName'] | Should -Be 'User'
+    }
+    It 'proves the cross-boundary order with one shared call log: warn, set, disable, clear' {
+        $script:log = @()
+        Mock Write-Warning -ModuleName OSDeploy.Orchestrator { $script:log += 'Warn' }
+        Mock Set-RegistryStoreValue -ModuleName OSDeploy.Orchestrator { $script:log += ('registry-set:' + $Name) }
+        Mock Remove-RegistryStoreValue -ModuleName OSDeploy.Orchestrator { $script:log += ('registry-remove:' + $Name) }
+        $setPassword = {
+            param([string]$NewPassword)
+            $script:log += 'SetPassword'
+            return $true
+        }
+        $reg = New-EztRegistry
+        $null = Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword $setPassword -Registry $reg
+        ($script:log -join ',') | Should -Be 'Warn,SetPassword,registry-set:AutoAdminLogon,registry-remove:DefaultPassword'
+    }
+    It 'warns that a successful password change ends automatic sign-in (Q86 warning requirement)' {
+        $script:warnText = $null
+        Mock Write-Warning -ModuleName OSDeploy.Orchestrator { $script:warnText = $Message }
+        $null = Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword { param([string]$NewPassword) return $true } -Registry (New-EztRegistry)
+        $script:warnText | Should -Not -BeNullOrEmpty
+        $script:warnText | Should -Match '(?i)automatic sign-in'
+        $script:warnText | Should -Match '(?i)password'
+    }
+    It 'a throwing SetPassword propagates and leaves ALL THREE states untouched' {
+        $reg = New-EztRegistry
+        $before = $reg | ConvertTo-Json -Depth 5
+        $script:setCalls = 0
+        $boom = {
+            param([string]$NewPassword)
+            $script:setCalls++
+            throw 'password service exploded'
+        }
+        { Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword $boom -Registry $reg } | Should -Throw 'password service exploded'
+        $script:setCalls | Should -Be 1
+        # State compare: the fixture is identical to its pre-call snapshot.
+        ($reg | ConvertTo-Json -Depth 5) | Should -Be $before
+        # Explicit field asserts: password unset, autologon intact, credential intact.
+        $winlogon = $reg[$script:EztWinlogonPath]
+        $winlogon['AutoAdminLogon'] | Should -Be '1'
+        $winlogon.Contains('DefaultPassword') | Should -BeTrue
+        $winlogon['DefaultPassword'] | Should -Be ''
+        $winlogon['DefaultUserName'] | Should -Be 'User'
+    }
+    It 'a $false-returning SetPassword is a failure: throw with all three states untouched' {
+        $reg = New-EztRegistry
+        $before = $reg | ConvertTo-Json -Depth 5
+        { Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword { param([string]$NewPassword) return $false } -Registry $reg } | Should -Throw
+        ($reg | ConvertTo-Json -Depth 5) | Should -Be $before
+        $reg[$script:EztWinlogonPath]['AutoAdminLogon'] | Should -Be '1'
+        $reg[$script:EztWinlogonPath].Contains('DefaultPassword') | Should -BeTrue
+    }
+    It 'removes the credential value rather than blanking it and never writes an AutoLogonCount (Q16/Q86)' {
+        $reg = New-EztRegistry
+        $null = Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword { param([string]$NewPassword) return $true } -Registry $reg
+        $winlogon = $reg[$script:EztWinlogonPath]
+        (@($winlogon.Keys | Sort-Object) -join ',') | Should -Be 'AutoAdminLogon,DefaultUserName'
+        @($reg.Keys).Count | Should -Be 1
+    }
+    It 'tolerates a store that never carried the Winlogon values (idempotent removal)' {
+        $reg = @{}
+        $r = Invoke-PasswordTransition -NewPassword 'Owner-Pass-1' -SetPassword { param([string]$NewPassword) return $true } -Registry $reg
+        ($r.AppliedSteps -join ',') | Should -Be 'Warn,SetPassword,DisableAutoLogon,ClearCredential'
+        $reg[$script:EztWinlogonPath]['AutoAdminLogon'] | Should -Be '0'
+        $reg[$script:EztWinlogonPath].Contains('DefaultPassword') | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-ActivationFlow incomplete-activation choices (Q19, Q18)' {
+    It 'offers exactly Retry, Finish Without Activation, Cancel with the incomplete state recorded' {
+        $r = Invoke-ActivationFlow -ActivationResult 'Failed'
+        (@($r.Choices) -join ',') | Should -Be 'Retry,Finish Without Activation,Cancel'
+        $r.Incomplete | Should -BeTrue
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'ActivationResult,Choices,Incomplete'
+        $r.ActivationResult | Should -Be 'Failed'
+    }
+    It 'a succeeded activation returns no choices and Incomplete false' {
+        $r = Invoke-ActivationFlow -ActivationResult 'Succeeded'
+        @($r.Choices).Count | Should -Be 0
+        $r.Incomplete | Should -BeFalse
+    }
+    It 'any non-success status is treated as incomplete (fail visible)' {
+        foreach ($status in @('TimedOut', 'Offline', 'NeedsAttention')) {
+            $r = Invoke-ActivationFlow -ActivationResult $status
+            $r.Incomplete | Should -BeTrue
+            @($r.Choices).Count | Should -Be 3
+        }
+    }
+    It 'never includes key material: no key-named property, no planted marker, no key-shaped value (Q18)' {
+        $planted = 'VK7JG-NPHTM-C97JM-9MPGT-3V66T'
+        $global:PlantedProductKey = $planted
+        try {
+            $r = Invoke-ActivationFlow -ActivationResult 'Failed'
+            (@($r.Keys) -join ',') | Should -Not -Match '(?i)key'
+            $text = $r | ConvertTo-Json -Depth 5
+            $text | Should -Not -Match [regex]::Escape($planted)
+            $text | Should -Not -Match '[A-Z0-9]{5}(-[A-Z0-9]{5}){4}'
+            foreach ($k in @($r.Keys)) {
+                ([string]$r[$k]) | Should -Not -Be $planted
+            }
+        }
+        finally {
+            Remove-Variable -Name PlantedProductKey -Scope Global -ErrorAction SilentlyContinue
+        }
     }
 }

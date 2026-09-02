@@ -1622,3 +1622,364 @@ function Invoke-ApplicationPhase {
         NeedsAcknowledgement = (@($failures).Count -gt 0)
     }
 }
+
+# ---------------------------------------------------------------------------
+# EZT workflow specifics: unattend autologon fragment, account plan,
+# password transition, activation flow (Q14/Q15/Q16/Q18/Q19/Q24/Q86)
+# ---------------------------------------------------------------------------
+
+# REGISTRY STORE INTERFACE (injectable, platform-independent)
+#
+# Windows registry operations in this section are abstracted behind a
+# plain-hashtable "registry store" so the logic runs (and is tested) on
+# any platform; the CI suite executes on Linux. The store shape is:
+#
+#   @{ <registry path string> = @{ <value name> = <value>; ... }; ... }
+#
+# Example (the deployed EZT Winlogon state, Q16/Q24):
+#
+#   @{ 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' =
+#       @{ DefaultUserName = 'User'; DefaultPassword = ''; AutoAdminLogon = '1' } }
+#
+# Contract, implemented by the helpers directly below:
+# - Set-RegistryStoreValue creates the path's value table when missing and
+#   sets the value name. Hashtable keys are case-insensitive, matching
+#   Windows registry value-name semantics.
+# - Remove-RegistryStoreValue deletes the value name; an absent name is a
+#   no-op (idempotent removal - exactly what the Q86 credential clear
+#   needs).
+# - Path keys are literal path strings; every caller in this module uses
+#   the $script:EztWinlogonPath constant so code and tests cannot drift.
+# A Get/read helper joins this interface together with its first reader
+# (the host wiring or the recovery path that restores the passwordless
+# automatic-sign-on state); it is not added speculatively now.
+# The real Windows registry adapter arrives with the host wiring change
+# and is injected through the same -Registry parameter.
+
+$script:EztWinlogonPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+
+# Default store used when -Registry is not injected. Tests always inject a
+# fresh fixture; a later host-wiring change binds the real adapter here.
+$script:RegistryStore = @{}
+
+# Internal: set one registry value in the store, creating the path's value
+# table when missing.
+function Set-RegistryStoreValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Registry,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    if (-not $Registry.Contains($Path) -or $null -eq $Registry[$Path]) {
+        $Registry[$Path] = @{}
+    }
+    $Registry[$Path][$Name] = $Value
+}
+
+# Internal: remove one registry value name from the store; absent names are
+# a no-op.
+function Remove-RegistryStoreValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Registry,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if (-not $Registry.Contains($Path)) { return }
+    $values = $Registry[$Path]
+    if ($null -eq $values) { return }
+    if ($values.Contains($Name)) {
+        $null = $values.Remove($Name)
+    }
+}
+
+function New-EztUnattend {
+    <#
+        .SYNOPSIS
+        Builds the EZT unattend XML fragment: registry-sync automatic
+        sign-on for the passwordless User account (Q14/Q15/Q16/Q24).
+
+        .DESCRIPTION
+        Q16 requires UNLIMITED persistent automatic sign-in, so this
+        function implements the REGISTRY-SYNC form: the specialize pass
+        carries RunSynchronous reg add commands that write the three
+        Winlogon values - DefaultUserName = 'User', DefaultPassword = ''
+        (the passwordless account's empty credential), and AutoAdminLogon
+        = '1'. There is deliberately NO AutoLogonCount element or value
+        anywhere: a count would cap automatic sign-in at N sign-ins,
+        which Q16 supersedes. Invoke-EztAccountPhase re-asserts the same
+        values at runtime through the registry store interface.
+
+        Q18: no product-key field exists anywhere in the document. The
+        UserData element carries only the EULA acceptance, and the
+        windowsPE ImageInstall MetaData pins the applied image by NAME
+        ('Windows 11 <Edition>'); its <Key> child is the image-metadata
+        selector (/IMAGE/NAME), never license-key material. Product-key
+        entry happens transiently in the activation flow
+        (Invoke-ActivationFlow) and is never written to unattend content.
+
+        -Edition selects the image name; -TimeZone lands in the oobeSystem
+        Microsoft-Windows-Shell-Setup element. Both are XML-escaped.
+        Computer naming is not automated (Q13): no ComputerName element is
+        written. Returns the document as a string (parseable with [xml]).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Edition,
+        [Parameter(Mandatory)][string]$TimeZone
+    )
+    $imageValue = [System.Security.SecurityElement]::Escape(('Windows 11 ' + $Edition))
+    $timeZoneValue = [System.Security.SecurityElement]::Escape($TimeZone)
+    $template = @'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/NAME</Key>
+              <Value>{0}</Value>
+            </MetaData>
+          </InstallFrom>
+        </OSImage>
+      </ImageInstall>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>EZT automatic sign-on: default user name (Q16)</Description>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d "User" /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>EZT automatic sign-on: empty credential for the passwordless account (Q14)</Description>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d "" /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>EZT automatic sign-on: automatic logon value on, with no count so sign-in stays unlimited (Q16)</Description>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d "1" /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <TimeZone>{1}</TimeZone>
+    </component>
+  </settings>
+</unattend>
+'@
+    return ($template -f $imageValue, $timeZoneValue)
+}
+
+function Invoke-EztAccountPhase {
+    <#
+        .SYNOPSIS
+        Builds and executes the EZT account plan: passwordless User,
+        disabled built-in Administrator, managed password shortcut
+        (Q14/Q15/Q24).
+
+        .DESCRIPTION
+        The plan carries EXACTLY four steps:
+        1. CreateUser - the local account 'User', passwordless
+           (Password = $null, Passwordless = $true) per Q14/Q15.
+        2. AddGroupMember - 'User' into 'Administrators': a local
+           administrator account that is NOT the built-in one.
+        3. EnsureUserDisabled - the built-in 'Administrator' STAYS
+           disabled (Q24); the step is an idempotent ensure. The plan
+           contains NO enable action anywhere: EZT never activates the
+           built-in account.
+        4. CreateShortcut - 'Set or Change Your Password' on the common
+           (public) desktop C:\Users\Public\Desktop, targeting the staged
+           managed workflow entry point
+           C:\ProgramData\OSDeploy\Set-OwnerPassword.ps1 (TargetKind =
+           'ManagedWorkflow'). Per Q15 the shortcut NEVER targets
+           ms-settings:signinoptions: it launches the managed graphical
+           transition backed by Invoke-PasswordTransition (Q86). The
+           launcher's final on-host form arrives with the host wiring;
+           the contract locked here is the managed-workflow target.
+
+        Execution model: each step object is handed to -Runner in plan
+        order. The DEFAULT Runner is a recorder that acknowledges each
+        step without side effects, so planning stays inspectable on any
+        platform; the real Windows account operations arrive with the host
+        wiring as an injected Runner. A Runner signals failure by throwing
+        or by returning boolean $false (the module-wide failure
+        convention); the failure propagates and nothing later runs.
+
+        When -Registry is bound, a fully successful execution seeds the
+        three persistent Winlogon automatic sign-on values through the
+        registry store - the runtime re-assertion of the unattend's
+        registry sync (Q16/Q24: unlimited sign-in, no count). Seeding
+        happens only after every step succeeded; a failed step leaves the
+        store untouched. Omitting -Registry skips the re-assertion.
+
+        Returns @{ Steps; Executed }: the plan and the steps the Runner
+        processed successfully.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$Registry,
+        [scriptblock]$Runner
+    )
+    $steps = @(
+        @{ Action = 'CreateUser'; Name = 'User'; Password = $null; Passwordless = $true }
+        @{ Action = 'AddGroupMember'; Name = 'User'; Group = 'Administrators' }
+        @{ Action = 'EnsureUserDisabled'; Name = 'Administrator' }
+        @{
+            Action     = 'CreateShortcut'
+            Name       = 'Set or Change Your Password'
+            Directory  = 'C:\Users\Public\Desktop'
+            Target     = 'C:\ProgramData\OSDeploy\Set-OwnerPassword.ps1'
+            TargetKind = 'ManagedWorkflow'
+        }
+    )
+    $runner = $Runner
+    if ($null -eq $runner) {
+        # Default Runner: the recorder. Real Windows account work arrives
+        # with the host wiring as an injected Runner.
+        $runner = { param($Step) return $true }
+    }
+    $executed = @()
+    foreach ($step in $steps) {
+        $output = & $runner $step
+        if ($output -is [bool] -and $output -eq $false) {
+            throw ('Account phase step {0} failed: the Runner signalled failure (boolean $false). No later step runs and no registry seeding happens.' -f $step.Action)
+        }
+        $executed += $step
+    }
+    if ($null -ne $Registry) {
+        Set-RegistryStoreValue -Registry $Registry -Path $script:EztWinlogonPath -Name 'DefaultUserName' -Value 'User'
+        Set-RegistryStoreValue -Registry $Registry -Path $script:EztWinlogonPath -Name 'DefaultPassword' -Value ''
+        Set-RegistryStoreValue -Registry $Registry -Path $script:EztWinlogonPath -Name 'AutoAdminLogon' -Value '1'
+    }
+    return @{ Steps = @($steps); Executed = @($executed) }
+}
+
+function Invoke-PasswordTransition {
+    <#
+        .SYNOPSIS
+        Q86's ONE controlled transition: warn, set the password, disable
+        automatic sign-on, clear the stored credential.
+
+        .DESCRIPTION
+        Exact order (assertable through AppliedSteps and the warning):
+        1. Warn - Write-Warning tells the owner that a successful change
+           ends automatic sign-in (Q86's warning requirement).
+        2. SetPassword - the injected scriptblock is invoked as
+           & $SetPassword -NewPassword <password>. A THROW propagates
+           unchanged BEFORE any state is touched; a boolean $false return
+           is the module-wide failure signal and throws here too. In both
+           failure shapes ALL THREE states stay untouched: the password
+           is not set, AutoAdminLogon keeps its value, and the
+           DefaultPassword value is NOT removed.
+        3. DisableAutoLogon - AutoAdminLogon is set to '0' in the registry
+           store; reached only when the password change succeeded.
+        4. ClearCredential - the DefaultPassword value is REMOVED from
+           the store (deleted, not blanked: the stale credential must not
+           exist at all).
+
+        The DEFAULT SetPassword (when -SetPassword is omitted) is the
+        deployed-host path: ConvertTo-SecureString plus Set-LocalUser on
+        the 'User' account. It needs the Windows commands and the host
+        wiring; tests always inject.
+
+        -Registry is the injectable registry store; when omitted the
+        module's default store is used (the host wiring later binds the
+        real adapter there). The transition never writes an AutoLogonCount
+        value (Q16: unlimited sign-in has no counter to adjust).
+
+        Returns @{ AppliedSteps } - the ordered record of what ran.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$NewPassword,
+        [scriptblock]$SetPassword,
+        [hashtable]$Registry
+    )
+    $store = $Registry
+    if ($null -eq $store) { $store = $script:RegistryStore }
+    $setPasswordRunner = $SetPassword
+    if ($null -eq $setPasswordRunner) {
+        $setPasswordRunner = {
+            param([Parameter(Mandatory)][string]$NewPassword)
+            $secure = ConvertTo-SecureString -String $NewPassword -AsPlainText -Force
+            Set-LocalUser -Name 'User' -Password $secure
+        }
+    }
+    $applied = @()
+
+    # Step 1: the Q86 warning comes first, before anything is asked of the
+    # password callback.
+    Write-Warning -Message ('Setting a password will turn off automatic sign-in for the User account. ' +
+        'After this change Windows asks for the new password at sign-in; password-protected automatic sign-in is not supported.')
+    $applied += 'Warn'
+
+    # Step 2: the password change. Failure (throw or $false) surfaces
+    # before any of the three state writes below.
+    $output = & $setPasswordRunner -NewPassword $NewPassword
+    if ($output -is [bool] -and $output -eq $false) {
+        throw 'The password change was reported as failed by the SetPassword callback (boolean $false). No state was changed.'
+    }
+    $applied += 'SetPassword'
+
+    # Step 3: disable automatic sign-on in the registry store.
+    Set-RegistryStoreValue -Registry $store -Path $script:EztWinlogonPath -Name 'AutoAdminLogon' -Value '0'
+    $applied += 'DisableAutoLogon'
+
+    # Step 4: clear the stored automatic-logon credential (remove, not
+    # blank).
+    Remove-RegistryStoreValue -Registry $store -Path $script:EztWinlogonPath -Name 'DefaultPassword'
+    $applied += 'ClearCredential'
+
+    return @{ AppliedSteps = @($applied) }
+}
+
+function Invoke-ActivationFlow {
+    <#
+        .SYNOPSIS
+        Shapes the Q19 activation decision surface when activation could
+        not be completed.
+
+        .DESCRIPTION
+        -ActivationResult is a STATUS TOKEN, never key material:
+        - 'Succeeded' (case-insensitive): activation completed; the flow
+          returns Incomplete = $false with NO choices.
+        - ANY other value ('Failed', 'TimedOut', 'Offline', ...): the
+          activation is incomplete, and the return carries the three Q19
+          choices - 'Retry' (Q19's Retry Activation), 'Finish Without
+          Activation', and 'Cancel' - with Incomplete = $true recording
+          the incomplete state.
+
+        Q18: this function has NO key parameter and its return NEVER
+        includes key material. Product keys are handled transiently by
+        the activation UI and are never stored or logged; the return
+        object is exactly @{ ActivationResult; Choices; Incomplete } - a
+        status echo and decision data, nothing else. The warning Q19
+        requires before finishing without activation belongs to the
+        consumer that acts on the 'Finish Without Activation' choice.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ActivationResult
+    )
+    if ($ActivationResult -ieq 'Succeeded') {
+        return @{ ActivationResult = $ActivationResult; Choices = @(); Incomplete = $false }
+    }
+    return @{
+        ActivationResult = $ActivationResult
+        Choices          = @('Retry', 'Finish Without Activation', 'Cancel')
+        Incomplete       = $true
+    }
+}
