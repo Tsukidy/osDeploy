@@ -43,6 +43,12 @@ foreach ($file in $parseRoots) {
     }
 }
 # --- Check 3: ASCII-only bytes (added in Task 4) ---
+foreach ($file in $parseRoots) {
+    $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -gt 127) { Add-Failure ("ASCII {0}: byte 0x{1:x2} at offset {2}" -f $file.FullName, $bytes[$i], $i); break }
+    }
+}
 
 foreach ($f in $failures) { Write-Output "GATE FAIL: $f" }
 if ($failures.Count -gt 0) { exit 1 }
