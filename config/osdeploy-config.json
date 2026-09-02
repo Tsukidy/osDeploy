@@ -1,0 +1,17 @@
+{
+    "OrderDatabase": {
+        "Host": "", "Port": 3306, "Database": "", "Username": "", "Password": "",
+        "Table": "",
+        "ColumnMap": { "OrderNumber": "", "Company": "", "EditionDefault": "", "RegulatedState": "" }
+    },
+    "Deployment": {
+        "RecoveryPartitionSizeMB": 32768,
+        "WindowsReToolsPartitionSizeMB": 1024,
+        "RecommendedPrimaryDriveSizeMB": 122070,
+        "TimeZone": "Pacific Standard Time"
+    },
+    "Logging": { "LocalLogHistoryMaxMB": 1024 },
+    "WindowsUpdate": { "MaxCycles": 3 },
+    "RegulatedStates": ["CA"],
+    "CompanyWorkflowMap": { "EZT": "EZT", "EZ Trading Computers": "EZT", "*": "MMC" }
+}
