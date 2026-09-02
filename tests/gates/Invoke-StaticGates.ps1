@@ -19,6 +19,29 @@ foreach ($file in $parseRoots) {
     foreach ($e in $errors) { Add-Failure ("PARSE {0}: {1}" -f $file.FullName, $e.Message) }
 }
 # --- Check 2: banned constructs (added in Task 3) ---
+# PS 5.1 compatibility: reject PS7-only operators in non-comment source text.
+# A line ending in "# gate:allow" is exempt (regex pattern strings in this gate,
+# or legitimate installer argument strings).
+$bannedPatterns = @(
+    @{ Pattern = '&&';         Name = 'pipeline chain operator' },    # gate:allow
+    @{ Pattern = '\|\|';       Name = 'pipeline chain operator' },    # gate:allow
+    @{ Pattern = '\?\?=';      Name = 'null-coalescing assignment' }, # gate:allow
+    @{ Pattern = '\?\?';       Name = 'null-coalescing operator' }    # gate:allow
+)
+foreach ($file in $parseRoots) {
+    $lines = @(Get-Content -LiteralPath $file.FullName)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '#\s*gate:allow\s*$') { continue }
+        $code = ($lines[$i] -split '#')[0]
+        foreach ($b in $bannedPatterns) {
+            if ($code -match $b.Pattern) { Add-Failure ("BANNED {0}: line {1} uses {2}" -f $file.FullName, ($i + 1), $b.Name) }
+        }
+        # ternary heuristic: "?" and ":" each surrounded by spaces on the same line
+        if ($code -match '[^?]?\s\?\s' -and $code -match '\s:\s') {
+            Add-Failure ("BANNED {0}: line {1} looks like a ternary" -f $file.FullName, ($i + 1))
+        }
+    }
+}
 # --- Check 3: ASCII-only bytes (added in Task 4) ---
 
 foreach ($f in $failures) { Write-Output "GATE FAIL: $f" }
