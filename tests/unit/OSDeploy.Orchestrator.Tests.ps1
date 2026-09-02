@@ -714,9 +714,11 @@ Describe 'Complete-Deployment Q89 completion gating' {
         # TEXT because pwsh 7 auto-types ISO strings to [datetime] on read
         # (Task 16 note) - and never hardcoded, only shape-matched.
         ([System.IO.File]::ReadAllText($script:statePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
-        # No block markers on the success path.
+        # Success carries positive completion polarity and NO block record:
+        # Completed = $true is set and BlockedBy is absent (a retry after a
+        # blocked attempt must land on the same shape as a first-try success).
+        $after.Completed | Should -BeTrue
         $after.PSObject.Properties['BlockedBy'] | Should -BeNullOrEmpty
-        $after.PSObject.Properties['Completed'] | Should -BeNullOrEmpty
         # Cleanup ran, and the verified run log survived it (Logs retained).
         Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
@@ -736,6 +738,34 @@ Describe 'Complete-Deployment Q89 completion gating' {
         # The runtime target was still attempted (failures are collected,
         # never first-abort), so a restart retries the whole order cleanly.
         Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+    }
+    It 'a retry after a cleanup failure completes cleanly: no stale BlockedBy, CompletedUtc present' {
+        # Round 1: cleanup fails and the block is durably checkpointed.
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $blocked = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $blocked.Completed | Should -BeFalse
+        $blocked.BlockedBy | Should -Be 'CleanupFailure'
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Match 'CleanupFailure'
+        # The technician clears the obstruction and a fresh marker is staged;
+        # the restart retries the full Q89 order.
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Recurse -Force
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\TaskRegistration.json') -Value @{
+            TaskName      = 'OSDeploy Orchestrator'
+            RegisteredUtc = [datetime]::UtcNow.ToString('o')
+        }
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeTrue
+        $r.Result | Should -Be 'Completed'
+        # The FINAL authoritative document carries no stale block record:
+        # no BlockedBy field and no CleanupFailure text anywhere in the file.
+        $final = Read-JsonFile -Path $script:statePath
+        $final.Completed | Should -BeTrue
+        $final.PSObject.Properties['BlockedBy'] | Should -BeNullOrEmpty
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Not -Match 'CleanupFailure'
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+        # The retried cleanup consumed the restored marker as well.
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
     }
     It 'blocks on final-log verification failure after successful cleanup, leaving the checkpoint untouched' {
         [System.IO.File]::AppendAllText($script:eventsPath, 'this line is not json' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
@@ -795,14 +825,21 @@ Describe 'Invoke-PostCompletionRestart cleanup-only restart (Q89)' {
         Remove-Item -Recurse -Force $script:troot -ErrorAction SilentlyContinue
     }
     It 'performs cleanup with zero phase-action invocations and no state change' {
+        # Regression-sensitive wiring (fix round 1): the phase engine entry
+        # points are MOCKED with counters, so any invocation from inside the
+        # post-completion path moves the count and fails the assertion. An
+        # unwired scriptblock counter cannot fail (review Minor #1).
         $script:phaseCalls = 0
-        $phaseAction = { $script:phaseCalls++ }
+        Mock Invoke-Phase -ModuleName OSDeploy.Orchestrator { $script:phaseCalls++ }
+        Mock Invoke-WithAttempts -ModuleName OSDeploy.Orchestrator { $script:phaseCalls++ }
         $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
         $r = Invoke-PostCompletionRestart -PartitionRoot $script:troot
         $r.Ok | Should -BeTrue
         @($r.Failures).Count | Should -Be 0
-        # No phase action ran: the counter never moved.
+        # No phase engine entry point ran.
         $script:phaseCalls | Should -Be 0
+        Should -Invoke Invoke-Phase -ModuleName OSDeploy.Orchestrator -Exactly 0 -Scope It
+        Should -Invoke Invoke-WithAttempts -ModuleName OSDeploy.Orchestrator -Exactly 0 -Scope It
         # The state (Result, CompletedUtc, everything) is byte-identical.
         (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
         Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
@@ -810,6 +847,7 @@ Describe 'Invoke-PostCompletionRestart cleanup-only restart (Q89)' {
         # A second restart is equally clean (idempotent).
         $again = Invoke-PostCompletionRestart -PartitionRoot $script:troot
         $again.Ok | Should -BeTrue
+        $script:phaseCalls | Should -Be 0
         (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
     }
     It 'Complete-Deployment with Result already set delegates to the post-completion restart (cleanup shape, no re-completion)' {

@@ -756,6 +756,29 @@ function Set-OrchestratorField {
     Add-Member -InputObject $Record -MemberType NoteProperty -Name $Name -Value $Value
 }
 
+# Internal: REMOVE one field from a hashtable or PSCustomObject state record.
+# Absent fields are a no-op. Used by the completion path so a successfully
+# completed checkpoint never carries a stale block record from an earlier
+# blocked attempt (fix round 1): success sets Completed = $true and REMOVES
+# BlockedBy, rather than nulling it, so a completed document is shape-identical
+# whether the run completed first-try or after a blocked retry.
+function Remove-OrchestratorField {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains($Name)) {
+            $null = $Record.Remove($Name)
+        }
+        return
+    }
+    if ($null -ne $Record.PSObject.Properties[$Name]) {
+        $null = $Record.PSObject.Properties.Remove($Name)
+    }
+}
+
 # Internal: locate the CURRENT (newest) run folder under a Logs root. Uses the
 # same ordering key Invoke-LogRetention uses: the <yyyyMMdd-HHmmss> timestamp
 # embedded in the folder name, LastWriteTime as the fallback for foreign
@@ -897,9 +920,14 @@ function Complete-Deployment {
         @{ Completed = $false; BlockedBy = 'LogVerification' } with the
         checkpoint untouched, so the next invocation retries.
 
-        Step 4 - only then: Result = Handoff and CompletedUtc (an ISO 8601
-        UTC string) are written through New-Checkpoint (validated, atomic)
-        and @{ Completed = $true; Result } is returned.
+        Step 4 - only then: Result = Handoff, Completed = $true, and
+        CompletedUtc (an ISO 8601 UTC string) are written through
+        New-Checkpoint (validated, atomic) and
+        @{ Completed = $true; Result } is returned. Any BlockedBy left by an
+        earlier blocked attempt is REMOVED (not nulled) in the same write,
+        so the final authoritative document never carries a stale block
+        record: a retry-after-block success and a first-try success produce
+        shape-identical completed states.
 
         CompletedUtc is NEVER written on a blocked path.
     #>
@@ -973,6 +1001,11 @@ function Complete-Deployment {
     }
 
     Set-OrchestratorField -Record $state -Name 'Result' -Value $Handoff
+    # Positive completion polarity, and NO stale block record: a run that
+    # completes after a blocked attempt must not land on a document that
+    # still says BlockedBy = 'CleanupFailure' alongside Result/CompletedUtc.
+    Set-OrchestratorField -Record $state -Name 'Completed' -Value $true
+    Remove-OrchestratorField -Record $state -Name 'BlockedBy'
     Set-OrchestratorField -Record $state -Name 'CompletedUtc' -Value (Get-Date).ToUniversalTime().ToString('o')
     $null = New-Checkpoint -State $state -Path $statePath
     return @{ Completed = $true; Result = $Handoff }
