@@ -1,0 +1,40 @@
+<!-- Acknowledge and Continue modal (Q26): shown when an application
+     installation still fails after its manifest retries. The host fills the
+     program, status, error or exit code, and log location fields at run time;
+     Continue is gated on the Acknowledge checkbox. Deployment then proceeds as
+     Completed with Warnings and retains the failure for final review. -->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Acknowledge and Continue"
+        Width="560" Height="420"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="HeaderText" Text="Application Installation Failed" FontSize="18" Margin="0,0,0,12" />
+        <TextBlock Grid.Row="1" Text="Program:" FontWeight="Bold" />
+        <TextBlock Grid.Row="2" Name="ProgramText" Text="-" Margin="0,2,0,8" />
+        <TextBlock Grid.Row="3" Text="Status:" FontWeight="Bold" />
+        <TextBlock Grid.Row="4" Name="StatusText" Text="-" Margin="0,2,0,8" />
+        <TextBlock Grid.Row="5" Text="Error or exit code:" FontWeight="Bold" />
+        <TextBlock Grid.Row="6" Name="ErrorText" Text="-" Margin="0,2,0,8" />
+        <TextBlock Grid.Row="7" Text="Log location:" FontWeight="Bold" />
+        <TextBlock Grid.Row="8" Name="LogText" Text="-" Margin="0,2,0,8" />
+        <CheckBox Grid.Row="9" Name="AcknowledgeCheckBox" Content="Acknowledge" Margin="0,4,0,8" />
+        <StackPanel Grid.Row="10" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Name="ContinueButton" Content="Continue" Padding="12,4" Margin="0,0,8,0" />
+            <Button Name="CancelButton" Content="Cancel" Padding="12,4" />
+        </StackPanel>
+    </Grid>
+</Window>

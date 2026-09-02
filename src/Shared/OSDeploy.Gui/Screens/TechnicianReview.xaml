@@ -1,0 +1,25 @@
+<!-- Technician Review screen: blocking review of findings that automated
+     retries could not clear. Findings populate the ListBox at run time; the
+     technician may rescan devices or rerun validation before continuing.
+     Rendering and shared styling are verified in the Windows VM component run;
+     this file is the declarative source consumed by the wizard host. -->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Technician Review"
+        Width="640" Height="480"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="HeaderText" Text="Technician Review" FontSize="18" Margin="0,0,0,8" />
+        <ListBox Grid.Row="1" Name="FindingsList" />
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Name="RescanDevicesButton" Content="Rescan Devices" Padding="12,4" Margin="0,0,8,0" />
+            <Button Name="RerunValidationButton" Content="Rerun Validation" Padding="12,4" Margin="0,0,8,0" />
+            <Button Name="ContinueButton" Content="Continue" Padding="12,4" />
+        </StackPanel>
+    </Grid>
+</Window>

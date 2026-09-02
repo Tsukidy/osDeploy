@@ -1,0 +1,23 @@
+<!-- Noted Issues Summary screen (Q68-Q72): the final summary lists noted
+     issues for technician review. The single acknowledgement checkbox plus the
+     Finish Deployment button is the delivery decision: the result may change
+     to Completed with Tech-Addressed Warnings only when the checked
+     acknowledgement is submitted with Finish Deployment. -->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Noted Issues Summary"
+        Width="640" Height="480"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Name="HeaderText" Text="Noted Issues Summary" FontSize="18" Margin="0,0,0,8" />
+        <ListBox Grid.Row="1" Name="IssuesList" />
+        <CheckBox Grid.Row="2" Name="AcknowledgeCheckBox" Content="I have reviewed the noted issues above" Margin="0,12,0,0" />
+        <Button Grid.Row="3" Name="FinishDeploymentButton" Content="Finish Deployment" HorizontalAlignment="Right" Padding="12,4" Margin="0,12,0,0" />
+    </Grid>
+</Window>
