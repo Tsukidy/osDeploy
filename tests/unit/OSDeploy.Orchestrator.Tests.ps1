@@ -18,6 +18,28 @@ BeforeAll {
         $parts = foreach ($f in $files) { '{0}={1}' -f $f.Name, (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash }
         return ($parts -join '|')
     }
+
+    # Task 18: fresh contract-valid state template for the attempt/resume
+    # engine tests. Identity values are the mock partition's fixed GUID-shaped
+    # strings so resume-identity assertions are deterministic.
+    function New-TestState {
+        return @{
+            RunId            = '11111111-1111-1111-1111-111111111111'
+            MachineId        = '22222222-2222-2222-2222-222222222222'
+            DiskId           = '33333333-3333-3333-3333-333333333333'
+            Workflow         = 'EZT'
+            Edition          = 'Pro'
+            Phase            = 'Drivers'
+            Attempt          = 0
+            RebootPending    = $false
+            ConfigVersion    = 'test-v1'
+            TimestampUtc     = [datetime]::UtcNow.ToString('o')
+            CompletedPhases  = @()
+            Result           = $null
+            NotedIssues      = @()
+            Acknowledgements = @()
+        }
+    }
 }
 AfterAll {
     # Release the single-instance lock exactly as the brief prescribes so no
@@ -181,5 +203,203 @@ Describe 'New-Checkpoint and Get-ResumePoint checkpoint engine' {
         $garbage = Join-Path $ckDir 'garbage.json'
         Set-Content -Path $garbage -Value 'not json at all' -Encoding Ascii
         { Get-ResumePoint -Path $garbage } | Should -Throw
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Task 18 (appended AFTER the existing Describes on purpose - see the ORDER
+# MATTERS note above): attempt policy, idempotent resume, and reboot
+# handling. None of these call Enter-Orchestrator. The round-trip and
+# no-context tests release the process-lifetime mutex and re-import the
+# module with -Force to simulate a process restart (fresh module context,
+# state rebuilt from the checkpoint FILE only), so they must never run
+# before the single-instance Describe above.
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-WithAttempts automatic attempt policy (Q36)' {
+    BeforeEach {
+        $script:calls = 0
+        $script:reviewCalls = 0
+        $script:reviewPhase = $null
+        $script:reviewAttempts = 0
+        $script:seenAttempts = @()
+        $script:cp = Join-Path $ckDir ('attempts-' + [guid]::NewGuid().ToString('N') + '.json')
+        $script:st = New-TestState
+        $null = New-Checkpoint -State $script:st -Path $script:cp
+        Set-OrchestrationContext -State $script:st -CheckpointPath $script:cp
+    }
+    It 'fails twice then succeeds on attempt 3: the phase completes and Attempt resets to 0' {
+        $action = { $script:calls++; if ($script:calls -lt 3) { throw 'flaky' }; 'ok' }
+        $onFailure = { param($Phase, $Attempts) $script:reviewCalls++ }
+        $r = Invoke-WithAttempts -Phase 'Drivers' -Action $action -OnFailure $onFailure
+        $r.Outcome | Should -Be 'Complete'
+        $r.Attempts | Should -Be 3
+        $script:calls | Should -Be 3
+        $script:reviewCalls | Should -Be 0
+        $rp = Get-ResumePoint -Path $script:cp
+        ($rp.CompletedPhases -join ',') | Should -Be 'Drivers'
+        $rp.Attempt | Should -Be 0
+    }
+    It 'an always-failing action reaches Technician Review exactly once with Attempts = 4 recorded in the result and the file' {
+        $action = { $script:calls++; throw 'always broken' }
+        $onFailure = {
+            param($Phase, $Attempts)
+            $script:reviewCalls++
+            $script:reviewPhase = $Phase
+            $script:reviewAttempts = $Attempts
+        }
+        $r = Invoke-WithAttempts -Phase 'Drivers' -Action $action -OnFailure $onFailure
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Attempts | Should -Be 4
+        $script:calls | Should -Be 3
+        $script:reviewCalls | Should -Be 1
+        $script:reviewPhase | Should -Be 'Drivers'
+        $script:reviewAttempts | Should -Be 4
+        $rp = Get-ResumePoint -Path $script:cp
+        $rp.Attempt | Should -Be 4
+        @($rp.CompletedPhases).Count | Should -Be 0
+    }
+    It 'checkpoints Attempt BEFORE each try (the file already records the attempt in flight)' {
+        $action = { $script:seenAttempts += (Get-ResumePoint -Path $script:cp).Attempt; throw 'nope' }
+        $r = Invoke-WithAttempts -Phase 'Drivers' -Action $action -OnFailure { param($Phase, $Attempts) }
+        $r.Outcome | Should -Be 'TechnicianReview'
+        ($script:seenAttempts -join ',') | Should -Be '1,2,3'
+    }
+    It 'resumes a crashed in-flight phase at the recorded attempt number (crash at attempt 2 means one more try)' {
+        # Simulate a crash mid-try-2: the file records Phase/Attempt but the
+        # phase never completed. The crashed attempt is consumed, so exactly
+        # one automatic try remains under the Q36 three-attempt cap.
+        $script:st.Phase = 'Drivers'
+        $script:st.Attempt = 2
+        $null = New-Checkpoint -State $script:st -Path $script:cp
+        $r = Invoke-WithAttempts -Phase 'Drivers' -Action { $script:calls++ } -OnFailure { param($Phase, $Attempts) }
+        $r.Outcome | Should -Be 'Complete'
+        $r.Attempts | Should -Be 3
+        $script:calls | Should -Be 1
+        $rp = Get-ResumePoint -Path $script:cp
+        $rp.Attempt | Should -Be 0
+        ($rp.CompletedPhases -join ',') | Should -Be 'Drivers'
+    }
+    It 'a phase already in CompletedPhases is skipped without any invocation (idempotent resume)' {
+        $script:st.CompletedPhases = @('Drivers', 'Audit')
+        $null = New-Checkpoint -State $script:st -Path $script:cp
+        $r = Invoke-WithAttempts -Phase 'Drivers' -Action { $script:calls++ } -OnFailure { param($Phase, $Attempts) }
+        $r.Outcome | Should -Be 'Skipped'
+        $script:calls | Should -Be 0
+    }
+    It 'Set-OrchestrationContext refuses a state that fails the contract (identity never defaulted)' {
+        $bad = @{
+            RunId = $null; MachineId = 'm1'; DiskId = 'd1'; Workflow = 'EZT'; Edition = 'Pro'
+            Phase = 'Drivers'; Attempt = 0; RebootPending = $false; ConfigVersion = 'v1'
+            TimestampUtc = '2026-01-01T00:00:00.0000000Z'; CompletedPhases = @(); Result = $null
+            NotedIssues = @(); Acknowledgements = @()
+        }
+        { Set-OrchestrationContext -State $bad -CheckpointPath $script:cp } | Should -Throw
+    }
+}
+
+Describe 'Invoke-Phase reboot handling and Resume-AfterReboot identity gate (Q35)' {
+    BeforeEach {
+        $script:calls = 0
+        $script:appsCalls = 0
+        $script:reviewCalls = 0
+        $script:seenReboot = @()
+        $script:cp = Join-Path $ckDir ('reboot-' + [guid]::NewGuid().ToString('N') + '.json')
+        $script:st = New-TestState
+        $null = New-Checkpoint -State $script:st -Path $script:cp
+        Set-OrchestrationContext -State $script:st -CheckpointPath $script:cp
+    }
+    It 'marks RebootPending=true in the file BEFORE delegating the action and returns RebootPending on a restart request' {
+        $action = {
+            $script:calls++
+            $script:seenReboot += [bool](Get-ResumePoint -Path $script:cp).RebootPending
+            Set-OrchestrationRestartRequested
+        }
+        $r = Invoke-Phase -Phase 'Drivers' -Action $action
+        $r.Outcome | Should -Be 'RebootPending'
+        $script:calls | Should -Be 1
+        # While the action is in flight the checkpoint already carries the
+        # marker, so a crash anywhere in the window forces the identity gate.
+        $script:seenReboot[0] | Should -BeTrue
+        $rp = Get-ResumePoint -Path $script:cp
+        $rp.RebootPending | Should -BeTrue
+        ($rp.CompletedPhases -join ',') | Should -Be 'Drivers'
+        $rp.Attempt | Should -Be 0
+    }
+    It 'completes normally with RebootPending=false when the action does not request a restart' {
+        $r = Invoke-Phase -Phase 'Drivers' -Action { $script:calls++ }
+        $r.Outcome | Should -Be 'Complete'
+        $rp = Get-ResumePoint -Path $script:cp
+        $rp.RebootPending | Should -BeFalse
+        ($rp.CompletedPhases -join ',') | Should -Be 'Drivers'
+    }
+    It 'exhaustion through Invoke-Phase clears the reboot marker and reaches review exactly once' {
+        $r = Invoke-Phase -Phase 'Drivers' -Action { $script:calls++; throw 'broken' } -OnFailure {
+            param($Phase, $Attempts)
+            $script:reviewCalls++
+        }
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Attempts | Should -Be 4
+        $script:reviewCalls | Should -Be 1
+        $rp = Get-ResumePoint -Path $script:cp
+        $rp.RebootPending | Should -BeFalse
+        $rp.Attempt | Should -Be 4
+    }
+    It 'full reboot round trip: the file keeps RebootPending while outstanding, resume validates identity, and completed phases are never re-invoked' {
+        # The phase's work finishes and it requests a restart.
+        $r1 = Invoke-Phase -Phase 'Drivers' -Action { $script:calls++; Set-OrchestrationRestartRequested }
+        $r1.Outcome | Should -Be 'RebootPending'
+        (Get-ResumePoint -Path $script:cp).RebootPending | Should -BeTrue
+        # Simulated restart: the process is gone. Release the process-lifetime
+        # lock so nothing leaks, re-import the module (all module state lost),
+        # and rebuild the context from the checkpoint FILE only.
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) { $m.ReleaseMutex(); $m.Dispose() }
+        Import-Module $script:modulePath -Force
+        Set-OrchestrationContext -State (Read-JsonFile -Path $script:cp) -CheckpointPath $script:cp
+        (Get-ResumePoint -Path $script:cp).RebootPending | Should -BeTrue
+        $rr = Resume-AfterReboot -Expected @{
+            MachineId = '22222222-2222-2222-2222-222222222222'
+            DiskId    = '33333333-3333-3333-3333-333333333333'
+        }
+        $rr.Outcome | Should -Be 'Ready'
+        $rr.State.DiskId | Should -Be '33333333-3333-3333-3333-333333333333'
+        (Get-ResumePoint -Path $script:cp).RebootPending | Should -BeFalse
+        # Idempotent resume: the completed phase is skipped with zero further
+        # invocations; the next phase in the sequence runs exactly once.
+        $r2 = Invoke-Phase -Phase 'Drivers' -Action { $script:calls++ }
+        $r2.Outcome | Should -Be 'Skipped'
+        $script:calls | Should -Be 1
+        $r3 = Invoke-Phase -Phase 'Apps' -Action { $script:appsCalls++ }
+        $r3.Outcome | Should -Be 'Complete'
+        $script:appsCalls | Should -Be 1
+        ((Get-ResumePoint -Path $script:cp).CompletedPhases -join ',') | Should -Be 'Drivers,Apps'
+    }
+    It 'a mismatched identity stops with zero phase work and no state mutation (CompletedPhases intact)' {
+        $r1 = Invoke-Phase -Phase 'Drivers' -Action { Set-OrchestrationRestartRequested }
+        $r1.Outcome | Should -Be 'RebootPending'
+        $before = (Get-FileHash -LiteralPath $script:cp -Algorithm SHA256).Hash
+        $rr = Resume-AfterReboot -Expected @{
+            MachineId = '99999999-9999-9999-9999-999999999999'
+            DiskId    = '33333333-3333-3333-3333-333333333333'
+        }
+        $rr.Outcome | Should -Be 'IdentityMismatch'
+        # Zero mutation: not even a checkpoint recording the mismatch.
+        (Get-FileHash -LiteralPath $script:cp -Algorithm SHA256).Hash | Should -Be $before
+        ((Get-ResumePoint -Path $script:cp).CompletedPhases -join ',') | Should -Be 'Drivers'
+    }
+    It 'a null or missing expected identity field is a mismatch, never a pass (fail closed)' {
+        $rr = Resume-AfterReboot -Expected @{ MachineId = $null; DiskId = '33333333-3333-3333-3333-333333333333' }
+        $rr.Outcome | Should -Be 'IdentityMismatch'
+        $rr2 = Resume-AfterReboot -Expected @{ DiskId = '33333333-3333-3333-3333-333333333333' }
+        $rr2.Outcome | Should -Be 'IdentityMismatch'
+    }
+    It 'throws when no orchestration context is bound (fail closed)' {
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) { $m.ReleaseMutex(); $m.Dispose() }
+        Import-Module $script:modulePath -Force
+        { Invoke-WithAttempts -Phase 'X' -Action { } -OnFailure { param($Phase, $Attempts) } } | Should -Throw
+        { Invoke-Phase -Phase 'X' -Action { } } | Should -Throw
+        { Resume-AfterReboot -Expected @{ MachineId = 'm'; DiskId = 'd' } } | Should -Throw
     }
 }
