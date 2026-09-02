@@ -491,6 +491,21 @@ Describe 'Integrity record and recheck (Q90/Q92)' {
         $r2.Ok | Should -BeFalse
         @($r2.Mismatches | Where-Object { $_.Reason -eq 'InvalidRecord' }).Count | Should -Be 1
     }
+    It 'an existing-but-EMPTY directory fails closed with every recorded file Missing (no exception)' {
+        # The "all files deleted, directory remains" tamper shape: the recheck
+        # must report it, never throw a binding error on the empty inventory.
+        Get-ChildItem -LiteralPath $script:engineDir -File | Remove-Item -Force
+        $r = Test-Integrity -Directory $script:engineDir -Record $script:record
+        $r.Ok | Should -BeFalse
+        $missing = @($r.Mismatches | Where-Object { $_.Reason -eq 'Missing' })
+        $missing.Count | Should -Be 2
+        (@($missing | ForEach-Object { $_.Path } | Sort-Object) -join ',') |
+            Should -Be 'Part1.psm1,Part2.psm1'
+        # Record generation refuses an empty tree outright (staging error)
+        # with its own clear throw, not a downstream binding exception.
+        { New-IntegrityRecord -Directory $script:engineDir -RecordPath ($script:recordPath + '.empty') } |
+            Should -Throw
+    }
 }
 
 Describe 'Repair-FromLocalSource local-only repair and the Q91 parameter boundary' {
@@ -548,5 +563,18 @@ Describe 'Repair-FromLocalSource local-only repair and the Q91 parameter boundar
             $offending = @($cmd.Parameters.Keys | Where-Object { $_ -match '(?i)share|unc|server|smb' })
             ('{0} parameters: [{1}]' -f $name, ($offending -join ', ')) | Should -Be ('{0} parameters: []' -f $name)
         }
+    }
+    It 'an empty-but-present repair source fails closed to Technician Review without throwing' {
+        # The recopy empties the damaged directory (nothing to copy) and the
+        # deciding recheck runs on that empty directory: the outcome must be
+        # the blocking review, never a binding exception that would bypass
+        # the Q92 second-failure routing.
+        [System.IO.File]::AppendAllText((Join-Path $script:engineDir 'Part1.psm1'), 'tamper')
+        $emptySrc = Join-Path $ckDir ('emptysrc-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $emptySrc | Out-Null
+        $r = Repair-FromLocalSource -Directory $script:engineDir -RepairSource $emptySrc -Record $script:record
+        $r.Repaired | Should -BeFalse
+        $r.Outcome | Should -Be 'TechnicianReview'
+        @(Get-ChildItem -LiteralPath $script:engineDir -Force).Count | Should -Be 0
     }
 }

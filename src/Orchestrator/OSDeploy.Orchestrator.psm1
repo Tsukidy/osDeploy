@@ -532,7 +532,10 @@ function New-IntegrityRecord {
         [Parameter(Mandatory)][string]$RecordPath
     )
     $inventory = Get-FlatInventory -Path $Directory
-    if (@($inventory).Count -eq 0) {
+    # Version-proof empty guard: @($null).Count is 1, so the null check must
+    # come first; a null or empty tree is refused with THIS clear error
+    # rather than a downstream binding exception from Get-BundleHash.
+    if ($null -eq $inventory -or @($inventory).Count -eq 0) {
         # An empty tree has nothing to attest: refuse rather than invent a
         # record whose bundle would describe no files (staging error).
         throw ("New-IntegrityRecord refuses an empty directory at '{0}'; the staged tree must contain the files to hash." -f $Directory)
@@ -556,6 +559,11 @@ function Get-InventoryIndex {
         [AllowEmptyCollection()]
         $Entries
     )
+    # $null admits here (an existing-but-empty directory reaches this helper
+    # as a null inventory): an empty side is a legitimate comparison input,
+    # never a binding failure. Without the guard, [AllowEmptyCollection()]
+    # still rejects $null and @($null) would fabricate a bogus '' key.
+    if ($null -eq $Entries) { return @{} }
     $index = @{}
     foreach ($entry in @($Entries)) {
         $path = [string](Get-OrchestratorField -Record $entry -Name 'Path')
@@ -565,13 +573,15 @@ function Get-InventoryIndex {
 }
 
 # Internal: New-FileInventory as an always-flat object[] (-NoEnumerate makes a
-# naive @() wrap double-nest its output, and an empty directory produces no
-# pipeline output at all; both normalize here).
+# naive @() wrap double-nest its output, and an empty directory produces an
+# array that plain 'return @()' would enumerate away to NO pipeline objects,
+# handing the caller $null; the comma wrapper keeps even the empty array
+# intact through the function boundary).
 function Get-FlatInventory {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
     $inventory = New-FileInventory -Path $Path
-    if ($null -eq $inventory) { return @() }
+    if ($null -eq $inventory) { return ,@() }
     return @($inventory)
 }
 
@@ -618,6 +628,11 @@ function Test-Integrity {
     $inventory = @()
     if (Test-Path -LiteralPath $Directory) {
         $inventory = Get-FlatInventory -Path $Directory
+        # Belt and braces for the existing-but-EMPTY directory: any pipeline
+        # quirk that yields no objects here must still compare as an empty
+        # tree (all files Missing), never throw past this point (the doc
+        # contract: fail closed, no exception).
+        if ($null -eq $inventory) { $inventory = @() }
     }
     $current = Get-InventoryIndex -Entries $inventory
     $recorded = Get-InventoryIndex -Entries $recordHashes
