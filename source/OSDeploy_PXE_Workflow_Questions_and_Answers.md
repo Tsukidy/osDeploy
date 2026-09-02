@@ -6,7 +6,7 @@
 
 **Later confirmed questions supersede conflicting parts of earlier questions. When two recorded answers conflict, the higher-numbered confirmed answer controls unless an even later answer explicitly changes it. Earlier answers remain in this file for decision history but must not be implemented where a later answer has replaced them.**
 
-Questions 1 through 94.
+Questions 1 through 100.
 
 ## Question 1
 
@@ -571,3 +571,39 @@ Questions 1 through 94.
 **Question:** How should boot-entry behavior distinguish the initial one-time deployment boot from the permanent Factory Recovery option?
 
 **Answer:** After the Deployment Partition Ready gate succeeds, the PXE bootstrap creates a one-time boot into the OSDCloud Deployment Partition without permanently making the partition the default boot target. During primary deployment, the partition may restart into itself as required by its deployment checkpoints. After Windows is installed and validated, register the persistent Factory Recovery entry while keeping Windows as the default boot target with the confirmed five-second menu timeout. Do not consider the persistent entry successfully installed until its partition identity and boot files have been validated. After successful deployment, clear every remaining initial-deployment-only boot override. Failure to register or validate the persistent Factory Recovery entry blocks final completion at Technician Review. Select the exact supported mechanism, such as UEFI BootNext, BCD bootsequence, or another method, during implementation testing against the current OSDCloud media layout and target motherboard firmware.
+
+## Question 95
+
+**Question:** How should the new deployment engine incorporate the existing driver-install and EZT post-install logic from the sibling scripts `autoAll.ps1` and `eztConfig.ps1`?
+
+**Answer:** Do not absorb or wrap either script. `autoAll.ps1` was written by someone else, is messy, and is not a source to pull from wholesale. `eztConfig.ps1` was built for a separate specific project and its changes are not required EZT profile content. The suite implements its own driver workflow and EZT post-install behavior from the confirmed requirements. Both existing scripts remain available as technique references only, where a specific bit is genuinely required, such as silent-install switch patterns or registry choreography.
+
+## Question 96
+
+**Question:** How should the suite determine which drivers apply to a machine, and how are they installed?
+
+**Answer:** Do not use driver manifests. The engine installs drivers by pattern matching the standardized installer naming that manufacturers already use, for example ASUS driver folders containing `AsusSetup.exe` and Gigabyte driver folders containing a single installer executable. It silently and recursively installs from the staged driver folders using the manufacturer installers and PnP. `autoAll.ps1` may be consulted as a technique reference for the pattern rules, consistent with Question 95.
+
+## Question 97
+
+**Question:** How should the deployment-share bundle be laid out and versioned, and does the existing driver share fold into it?
+
+**Answer:** Use one authoritative live share at `\\Deployment\DeploymentShare` with a fixed top-level taxonomy covering central configuration, bootstrap and controller files, the partition and engine payload, applications, the driver library, and the WinPE image. The live share content is the current version; bundle identity is the hash generated automatically at staging, with no manually maintained release manifests. The existing driver-share content and structure migrate into the share's driver library. The current driver-share creation scripts are kept in `reference-code/` in the repository as the structural reference.
+
+## Question 98
+
+**Question:** How should the controller reach the MySQL order database, and where do connection details, credentials, and the order-field mapping live?
+
+**Answer:** Keep the connection details, credentials, and the semantic order-field mapping, such as the table and the columns holding order number, company, edition default, and regulated state, in central configuration on the deployment share, loaded by the controller at start, so credential rotation and schema drift require only a configuration edit. Reuse the existing database account currently used for order access rather than creating a new dedicated account.
+
+## Question 99
+
+**Question:** What GUI framework should the deployment controller and the partition-side screens use?
+
+**Answer:** Use WPF with XAML. It matches the UI stack OSDCloud itself uses in WinPE, supports declarative wizard layouts for the controller and summary screens, and allows one shared GUI module to serve both the bootstrap controller and the partition-side deployment and recovery screens with a consistent appearance.
+
+## Question 100
+
+**Question:** What locale, region, and timezone defaults should deployment apply to installed Windows?
+
+**Answer:** Locale, region, and keyboard follow the validated Windows image, which is en-US, and the timezone comes from a central configuration value with a hard-coded default, following the established pattern that every configurable value has a hard-coded default and validated fallback. Not every workflow ends in OOBE: MMC completes at OOBE where the customer can still adjust region and keyboard, while EZT creates the full `User` account and finishes at the configured desktop with the staged locale values applied.

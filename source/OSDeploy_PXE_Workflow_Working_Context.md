@@ -140,7 +140,16 @@ Failure to register or validate the persistent Factory Recovery entry blocks fin
 
 Choose the exact supported boot-selection mechanism during implementation and lab testing against the installed current OSDCloud media layout and representative target motherboard firmware. Candidate mechanisms include UEFI BootNext, BCD bootsequence, or another method that satisfies the confirmed lifecycle without altering the persistent Windows default.
 
-### Factory Recovery
+#### Existing Script Asset Reference
+
+Two sibling scripts exist in the wider workspace and are non-authoritative references only:
+
+- `autoAll.ps1` (third-party driver installer consumed by the current driver share) is messy and must not be absorbed or wrapped. The suite implements its own driver workflow from the confirmed requirements.
+- `eztConfig.ps1` (a separate project's debloat and account-rename pipeline) is not required EZT profile content.
+
+Specific techniques may be borrowed from either where genuinely required, such as silent-install switch patterns or registry choreography. Neither script is staged, pinned, or invoked by the suite.
+
+## Factory Recovery
 
 Factory Recovery boots from the persistent OSDCloud Deployment Partition and runs its local OSDCloud instance plus the shared deployment engine without PXE.
 
@@ -208,10 +217,18 @@ During Initial Deployment and PXE Full Factory Rebuild, the deployment server ma
 - Application packages.
 - Driver libraries.
 - OSDCloud Deployment Partition content and deployment bundle sources.
-- Read-only MySQL order data access.
+- Read-only MySQL order data access. Connection details, credentials, and the semantic order-field mapping live in central configuration; the existing order-database account is reused.
 - A secondary destination for Initial Deployment logs.
 
 The complete partition-side deployment and recovery subset must be staged and validated before the PXE environment reboots into the OSDCloud Deployment Partition. Initial deployment from the partition and later Factory Recovery must not depend on the server being reachable.
+
+## Deployment Share Bundle
+
+- One authoritative live share at `\\Deployment\DeploymentShare` with a fixed top-level taxonomy: central configuration, bootstrap and controller files, the partition and engine payload, applications, the driver library, and the WinPE image.
+- The live share content is the current version. Bundle identity is the hash generated automatically at staging; there are no manually maintained release manifests.
+- The existing driver-share structure migrates into the driver library: `Drivers\Video\{AMD, Intel, NVIDIA\{Geforce, GeforceOLD, Quadro}}` organized by GPU vendor, and `Drivers\Chipset\<MotherboardModel>\{Chipset, LAN, Audio, WiFi}` per motherboard model.
+- The motherboard model folder name is `Win32_BaseBoard.Product` with non-alphanumerics stripped, and Micro-Star models additionally have the trailing six characters removed, matching the existing `RegisterMotherboardModel.ps1` behavior kept in `reference-code/`.
+- `reference-code/` in the repository holds `RecreateDriverShare.ps1` and `RegisterMotherboardModel.ps1` as the structural reference for the library.
 
 ## Configuration Authority
 
@@ -230,6 +247,8 @@ Current defaults include:
 | `RecoveryPartitionSizeMB` | 32768 |
 | `LocalLogHistoryMaxMB` | 1024 |
 | `RecommendedPrimaryDriveSizeMB` | 122070 |
+
+Locale, region, and keyboard follow the validated Windows image, which is en-US, and the timezone comes from central configuration with a hard-coded default. MMC completes at OOBE where the customer can still adjust region and keyboard; EZT finishes at the configured `User` desktop with the staged locale values applied.
 
 ## Workflow Profiles
 
@@ -308,6 +327,13 @@ Current defaults include:
 - If the refreshed local copy still fails, stop at blocking Technician Review.
 - Do not add signing certificates, pinned public keys, manually maintained release manifests, or a separate signing and release-management system.
 
+## Driver Workflow
+
+- Drivers are installed without manifests. The engine pattern matches the standardized installer naming manufacturers already use, such as ASUS folders containing `AsusSetup.exe` and Gigabyte folders containing a single installer executable, then silently and recursively installs from the staged driver folders using the manufacturer installers and PnP.
+- Driver failures still follow the confirmed driver failure rules: report clearly, preserve diagnostics, and route unresolved or functionally important failures to Technician Review.
+- `autoAll.ps1` may be consulted as a technique reference for the pattern rules only.
+- The driver library's organization and machine-to-folder mapping follow the migrated share structure described under Deployment Share Bundle.
+
 ## Windows Update Before Handoff
 
 - Run Windows Update during technician staging when internet access is available.
@@ -350,15 +376,21 @@ Active rule: remove Use Deployment Server Emergency Image from Technician Option
 
 ## Current Question State
 
-- Questions 1 through 94 are recorded in the active Markdown Q&A file.
-- Questions 88, 89, 90, 91, 92, 93, and 94 are confirmed, not pending.
+- Questions 1 through 100 are recorded in the active Markdown Q&A file.
+- Questions 88 through 100 are confirmed, not pending.
 - Question 91 supersedes the DeploymentShare emergency-image portions of Questions 52 through 55.
 - OSDCloud Deployment Partition is the canonical term for the persistent partition that performs the primary deployment and later Factory Recovery.
 - Question 92 establishes the automatic Deployment Partition Ready gate before PXE may configure the one-time boot.
 - Question 93 establishes fail-closed handling when readiness or disk-identity revalidation fails after the partition boots.
 - Current OSDCloud USB-media creation is an implementation reference for the partition's bootable-media design, not a directly reusable internal-disk layout.
 - Question 94 separates the initial one-time partition boot from the validated persistent Factory Recovery entry while retaining Windows as the default.
-- Question 95 is the next unanswered question.
+- Question 95 confirms the suite neither absorbs nor wraps the existing `autoAll.ps1` and `eztConfig.ps1`; both are technique references only and the driver workflow and EZT post-install are implemented fresh.
+- Question 96 confirms drivers install through pattern-matched, silent, recursive manufacturer-installer and PnP execution with no manifests.
+- Question 97 confirms one authoritative live deployment share whose content is the current version, with the existing driver-share structure migrating into its driver library and the creation scripts kept in `reference-code/` as reference.
+- Question 98 confirms the order-database connection details, credentials, and field mapping live in central configuration and the existing order-database account is reused.
+- Question 99 confirms WPF with XAML as the GUI framework for the bootstrap controller and the partition-side screens, sharing one GUI module.
+- Question 100 confirms en-US image locale with a configurable timezone default, and that EZT finishes at the configured desktop while MMC finishes at OOBE.
+- Question 101 is the next unanswered question.
 
 ## Working Files
 
