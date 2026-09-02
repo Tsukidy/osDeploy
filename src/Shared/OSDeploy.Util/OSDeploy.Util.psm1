@@ -8,7 +8,7 @@ function New-FileInventory {
     $root = (Resolve-Path -LiteralPath $Path).ProviderPath
     $items = @(Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object -Property FullName | ForEach-Object {
         New-Object pscustomobject -Property ([ordered]@{
-            Path   = $_.FullName.Substring($root.Length + 1)
+            Path   = $_.FullName.Substring($root.Length + 1).Replace([System.IO.Path]::DirectorySeparatorChar, '\')
             Size   = $_.Length
             Sha256 = Get-FileSha256 -Path $_.FullName
         })
