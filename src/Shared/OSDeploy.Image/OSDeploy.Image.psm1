@@ -207,3 +207,74 @@ function Test-ImageMetadata {
         IndexRecord = @($indexRecord.ToArray())
     }
 }
+
+# ---------------------------------------------------------------------------
+# Promotion lifecycle and edition resolution (Q48-Q52, Task 14)
+#
+# Q48-Q52 in one line: a downloaded image lands in a temp path, is validated
+# there, is atomically promoted into the local cache beside/over the existing
+# cached copy, and is revalidated at its STAGED location before the replace;
+# any failed validation deletes the newly downloaded bytes and NEVER damages
+# the existing cache (cache retention). When the cached image lacks the
+# requested edition, the technician is offered the three established choices
+# exactly - never a silent substitution. These functions are pure local file
+# and string operations: no network anywhere (the download itself is a later
+# phase's job; Microsoft-direct acquisition happens through other tooling).
+# ---------------------------------------------------------------------------
+
+function Invoke-ImagePromotion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TempPath,
+        [Parameter(Mandatory)][string]$CachePath,
+        [Parameter(Mandatory)][scriptblock]$Validator
+    )
+    # Stage 1: validate the temp download in place. A failed validation
+    # deletes ONLY the temp bytes - the existing cache is never touched.
+    $ok = & $Validator $TempPath
+    if (-not $ok) {
+        Remove-Item -LiteralPath $TempPath -Force
+        return @{ Promoted = $false; CacheIntact = $true }
+    }
+
+    # Stage 2: move the validated bytes to a staging name BESIDE the cache
+    # (same directory, so the final move onto the cache is a same-volume
+    # rename - atomic), then revalidate the copy at its staged location
+    # (reopen-and-revalidate after promotion). A failure here deletes only
+    # the staged copy; the existing cache still stands.
+    $cacheDirectory = Split-Path -Parent $CachePath
+    $stagingPath = Join-Path $cacheDirectory ('staging-' + [guid]::NewGuid().ToString('N'))
+    Move-Item -LiteralPath $TempPath -Destination $stagingPath -Force
+    $stagedOk = & $Validator $stagingPath
+    if (-not $stagedOk) {
+        Remove-Item -LiteralPath $stagingPath -Force
+        return @{ Promoted = $false; CacheIntact = $true }
+    }
+
+    # Stage 3: atomically replace the cache (or create it on first
+    # acquisition - a promote with no existing cache is valid).
+    Move-Item -LiteralPath $stagingPath -Destination $CachePath -Force
+    return @{ Promoted = $true; CacheIntact = $true }
+}
+
+function Resolve-EditionChoice {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Requested,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Available
+    )
+    # PowerShell -eq on strings is case-insensitive; the requested spelling
+    # is returned exactly as given when it is available.
+    foreach ($edition in $Available) {
+        if ($edition -eq $Requested) {
+            return @{ Edition = $Requested; Choices = $null }
+        }
+    }
+    # Unavailable: the three established choices, EXACTLY these strings in
+    # this order, with a null Edition - the technician decides, never a
+    # silent substitution of some other available edition.
+    return @{
+        Edition = $null
+        Choices = @('Choose Another Edition', 'Use Saved Default Edition', 'Cancel Recovery')
+    }
+}

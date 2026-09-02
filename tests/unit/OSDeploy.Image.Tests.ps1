@@ -326,3 +326,190 @@ Describe 'requirement parameters' {
         $err.Exception.Message | Should -Match 'RequiredRelease'
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 14: promotion lifecycle and edition resolution (Q48-Q52).
+# Real filesystem in temp directories - no mocking framework. Each It gets its
+# own case directory so per-case residue counting cannot see other cases.
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-ImagePromotion validate-then-move lifecycle (Q48-Q52)' {
+    BeforeAll {
+        $script:promoteDir = Join-Path ([System.IO.Path]::GetTempPath()) ('image-promote-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:promoteDir | Out-Null
+        $script:oldBytes = [System.Text.Encoding]::ASCII.GetBytes('EXISTING-CACHE-IMAGE-CONTENT')
+        $script:newBytes = [System.Text.Encoding]::ASCII.GetBytes('FRESHLY-DOWNLOADED-IMAGE-CONTENT')
+
+        # Validator harness: the module invokes the scriptblock as
+        # & $Validator <path> from inside its own session state, so the
+        # scriptblock must carry its counters in a closure (GetNewClosure)
+        # rather than relying on It-scope variables being reachable. State is
+        # a shared hashtable object: the test reads what the validator saw.
+        # Results = one boolean per permitted call; a call beyond the scripted
+        # results returns $null (falsy), so an unexpected extra call fails the
+        # surrounding assertions instead of passing silently.
+        function New-ValidatorHarness {
+            param([Parameter(Mandatory)][bool[]]$Results)
+            $state = @{
+                Results = @($Results)
+                Index   = 0
+                Seen    = New-Object System.Collections.Generic.List[object]
+            }
+            $validator = {
+                param($Path)
+                $entry = @{
+                    Path   = $Path
+                    Exists = (Test-Path -LiteralPath $Path)
+                    Sha256 = $null
+                }
+                if ($entry.Exists) {
+                    $entry.Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+                }
+                $state.Seen.Add($entry) | Out-Null
+                $result = $null
+                if ($state.Index -lt $state.Results.Count) { $result = $state.Results[$state.Index] }
+                $state.Index = $state.Index + 1
+                return $result
+            }.GetNewClosure()
+            return @{ State = $state; Validator = $validator }
+        }
+
+        function New-PromotionCase {
+            param([switch]$WithExistingCache)
+            $caseDir = Join-Path $script:promoteDir ('case-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $caseDir | Out-Null
+            $cache = Join-Path $caseDir 'image-cache.wim'
+            $temp = Join-Path $caseDir 'image-download.tmp'
+            if ($WithExistingCache) {
+                [System.IO.File]::WriteAllBytes($cache, $script:oldBytes)
+            }
+            [System.IO.File]::WriteAllBytes($temp, $script:newBytes)
+            return @{ CaseDir = $caseDir; Cache = $cache; Temp = $temp }
+        }
+    }
+    AfterAll { Remove-Item -Recurse -Force $script:promoteDir -ErrorAction SilentlyContinue }
+
+    It 'failed validation deletes the temp download, leaves the cache byte-identical, and never stages' {
+        $case = New-PromotionCase -WithExistingCache
+        $beforeHash = (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash
+        $harness = New-ValidatorHarness -Results @($false)
+        $r = Invoke-ImagePromotion -TempPath $case.Temp -CachePath $case.Cache -Validator $harness.Validator
+        $r.Promoted | Should -BeFalse
+        $r.CacheIntact | Should -BeTrue
+        (Test-Path -LiteralPath $case.Temp) | Should -BeFalse
+        (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash | Should -Be $beforeHash
+        @(Get-ChildItem -LiteralPath $case.CaseDir -File).Count | Should -Be 1
+        $harness.State.Seen.Count | Should -Be 1
+        $harness.State.Seen[0].Path | Should -Be $case.Temp
+    }
+
+    It 'successful promotion replaces the cache with the downloaded bytes and leaves no residue' {
+        $case = New-PromotionCase -WithExistingCache
+        $newHash = (Get-FileHash -LiteralPath $case.Temp -Algorithm SHA256).Hash
+        $harness = New-ValidatorHarness -Results @($true, $true)
+        $r = Invoke-ImagePromotion -TempPath $case.Temp -CachePath $case.Cache -Validator $harness.Validator
+        $r.Promoted | Should -BeTrue
+        $r.CacheIntact | Should -BeTrue
+        (Test-Path -LiteralPath $case.Temp) | Should -BeFalse
+        (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash | Should -Be $newHash
+        @(Get-ChildItem -LiteralPath $case.CaseDir -File).Count | Should -Be 1
+        $harness.State.Seen.Count | Should -Be 2
+    }
+
+    It 'validates the temp copy first, then the staged copy beside the cache' {
+        $case = New-PromotionCase -WithExistingCache
+        $newHash = (Get-FileHash -LiteralPath $case.Temp -Algorithm SHA256).Hash
+        $harness = New-ValidatorHarness -Results @($true, $true)
+        $r = Invoke-ImagePromotion -TempPath $case.Temp -CachePath $case.Cache -Validator $harness.Validator
+        $r.Promoted | Should -BeTrue
+        $harness.State.Seen.Count | Should -Be 2
+        # First call: the temp download itself.
+        $harness.State.Seen[0].Path | Should -Be $case.Temp
+        $harness.State.Seen[0].Exists | Should -BeTrue
+        $harness.State.Seen[0].Sha256 | Should -Be $newHash
+        # Second call: a NEW staging path, not the temp and not the cache,
+        # placed in the cache's directory under a staging- name, holding the
+        # downloaded bytes, and a real file at call time.
+        $stagedPath = [string]$harness.State.Seen[1].Path
+        $stagedPath | Should -Not -Be $case.Temp
+        $stagedPath | Should -Not -Be $case.Cache
+        (Split-Path -Parent $stagedPath) | Should -Be (Split-Path -Parent $case.Cache)
+        ([System.IO.Path]::GetFileName($stagedPath)) | Should -BeLike 'staging-*'
+        $harness.State.Seen[1].Exists | Should -BeTrue
+        $harness.State.Seen[1].Sha256 | Should -Be $newHash
+    }
+
+    It 'second-validation failure deletes the staged copy and leaves the cache byte-identical' {
+        $case = New-PromotionCase -WithExistingCache
+        $beforeHash = (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash
+        $harness = New-ValidatorHarness -Results @($true, $false)
+        $r = Invoke-ImagePromotion -TempPath $case.Temp -CachePath $case.Cache -Validator $harness.Validator
+        $r.Promoted | Should -BeFalse
+        $r.CacheIntact | Should -BeTrue
+        (Test-Path -LiteralPath $case.Temp) | Should -BeFalse
+        (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash | Should -Be $beforeHash
+        @(Get-ChildItem -LiteralPath $case.CaseDir -File).Count | Should -Be 1
+        $harness.State.Seen.Count | Should -Be 2
+    }
+
+    It 'creates the cache on first acquisition when no cache file exists yet' {
+        $case = New-PromotionCase
+        (Test-Path -LiteralPath $case.Cache) | Should -BeFalse
+        $newHash = (Get-FileHash -LiteralPath $case.Temp -Algorithm SHA256).Hash
+        $harness = New-ValidatorHarness -Results @($true, $true)
+        $r = Invoke-ImagePromotion -TempPath $case.Temp -CachePath $case.Cache -Validator $harness.Validator
+        $r.Promoted | Should -BeTrue
+        $r.CacheIntact | Should -BeTrue
+        (Test-Path -LiteralPath $case.Cache) | Should -BeTrue
+        (Get-FileHash -LiteralPath $case.Cache -Algorithm SHA256).Hash | Should -Be $newHash
+        @(Get-ChildItem -LiteralPath $case.CaseDir -File).Count | Should -Be 1
+    }
+
+    It 'result carries exactly the Promoted and CacheIntact keys in every outcome' {
+        $failCase = New-PromotionCase -WithExistingCache
+        $failHarness = New-ValidatorHarness -Results @($false)
+        $fail = Invoke-ImagePromotion -TempPath $failCase.Temp -CachePath $failCase.Cache -Validator $failHarness.Validator
+        ((@($fail.Keys) | Sort-Object) -join ',') | Should -Be 'CacheIntact,Promoted'
+        $okCase = New-PromotionCase -WithExistingCache
+        $okHarness = New-ValidatorHarness -Results @($true, $true)
+        $ok = Invoke-ImagePromotion -TempPath $okCase.Temp -CachePath $okCase.Cache -Validator $okHarness.Validator
+        ((@($ok.Keys) | Sort-Object) -join ',') | Should -Be 'CacheIntact,Promoted'
+    }
+}
+
+Describe 'Resolve-EditionChoice established choices (Q48-Q52)' {
+    It 'available edition returns directly with null Choices' {
+        $r = Resolve-EditionChoice -Requested 'Pro' -Available @('Home', 'Pro')
+        $r.Edition | Should -Be 'Pro'
+        $r.Choices | Should -BeNullOrEmpty
+        ((@($r.Keys) | Sort-Object) -join ',') | Should -Be 'Choices,Edition'
+    }
+    It 'matching is case-insensitive and the requested spelling is returned as given' {
+        $r = Resolve-EditionChoice -Requested 'home' -Available @('Home', 'Pro')
+        $r.Edition | Should -Be 'home'
+        $r.Choices | Should -BeNullOrEmpty
+    }
+    It 'unavailable edition yields exactly the three established choices with null Edition' {
+        $r = Resolve-EditionChoice -Requested 'Pro' -Available @('Home', 'Education')
+        $r.Edition | Should -BeNullOrEmpty
+        @($r.Choices).Count | Should -Be 3
+        (@($r.Choices) -join '|') | Should -Be 'Choose Another Edition|Use Saved Default Edition|Cancel Recovery'
+    }
+    It 'never substitutes an available edition silently' {
+        $r = Resolve-EditionChoice -Requested 'Enterprise' -Available @('Home', 'Pro')
+        $r.Edition | Should -BeNullOrEmpty
+        @($r.Choices) -contains 'Home' | Should -BeFalse
+        @($r.Choices) -contains 'Pro' | Should -BeFalse
+        @($r.Choices) -contains 'Enterprise' | Should -BeFalse
+    }
+    It 'empty Available yields the three choices (nothing is defaulted)' {
+        $r = Resolve-EditionChoice -Requested 'Home' -Available @()
+        $r.Edition | Should -BeNullOrEmpty
+        (@($r.Choices) -join '|') | Should -Be 'Choose Another Edition|Use Saved Default Edition|Cancel Recovery'
+    }
+    It 'empty Requested is unavailable (no edition is invented)' {
+        $r = Resolve-EditionChoice -Requested '' -Available @('Home', 'Pro')
+        $r.Edition | Should -BeNullOrEmpty
+        @($r.Choices).Count | Should -Be 3
+    }
+}
