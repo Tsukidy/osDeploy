@@ -88,10 +88,16 @@ Describe 'screen definitions (Q99 one shared module; Q100 ASCII)' {
     }
     It 'throws when a screen file is not well-formed XML' {
         # A planted corrupt screen must fail closed rather than reach a host.
-        $probe = Join-Path $screensDir '__ProbeInvalid.xaml'
+        # The probe name must be alnum-leading so the whitelist admits it and
+        # the corrupt file is actually read and parsed: an underscore-leading
+        # name would throw at name validation and never exercise the [xml]
+        # branch this test exists to cover. The message assertion pins the
+        # invalid-XML branch specifically, not just any throw.
+        $probe = Join-Path $screensDir 'ProbeInvalid.xaml'
         try {
             Set-Content -LiteralPath $probe -Value '<Window><Unclosed>' -Encoding Ascii
-            { Get-Screen -Name '__ProbeInvalid' } | Should -Throw
+            $err = { Get-Screen -Name 'ProbeInvalid' } | Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'not well-formed XML'
         }
         finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
     }
