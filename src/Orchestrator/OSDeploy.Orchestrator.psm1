@@ -1033,3 +1033,225 @@ function Invoke-PostCompletionRestart {
     )
     return (Invoke-Cleanup -PartitionRoot $PartitionRoot -TaskName $TaskName)
 }
+
+# ---------------------------------------------------------------------------
+# Driver phase: pattern-matched discovery and dry-runnable execution (Q96, Q27)
+# ---------------------------------------------------------------------------
+
+# Q96 contract: drivers are discovered by PATTERN, never by manifest. The
+# staged Sources\Drivers tree is walked folder by folder and classified by
+# the standardized installer naming manufacturers already use (ASUS folders
+# hold AsusSetup.exe; Gigabyte folders hold a single installer executable).
+# No file other than the .exe payloads is ever opened, so a manifest.json
+# planted under the tree is invisible to this engine. Q95: the legacy
+# autoAll.ps1 / eztConfig.ps1 scripts are never invoked by this phase.
+
+function Find-DriverInstallers {
+    <#
+        .SYNOPSIS
+        Classifies a staged driver tree into ordered installer plans.
+
+        .DESCRIPTION
+        Recurses every directory AT OR BELOW -Root (the root itself is a
+        candidate, so pointing Root at one driver folder yields exactly
+        that folder's plan) and applies the Q96 pattern rules:
+
+        1. AsusSetup.exe directly in the folder (case-insensitive match on
+           the full file name; the .exe extension match is case-insensitive
+           everywhere) -> @{ Folder; Installer = 'AsusSetup.exe'; Pattern = 'Asus' }.
+           The Asus rule wins even when other .exe files sit beside
+           AsusSetup.exe: ASUS convention makes AsusSetup.exe THE installer.
+        2. Exactly one .exe that is not AsusSetup.exe AND no .exe in any
+           subfolder -> @{ Folder; Installer = <name>; Pattern = 'SingleExe' }
+           (the Gigabyte single-installer convention).
+        3. Any other folder yields NO plan and is recorded in SkippedFolders
+           with its reason: 'NoInstaller' (zero .exe - the scanned root and
+           plain parent folders land here), 'MultipleInstallers', or
+           'NestedInstaller' (one direct .exe with another below it).
+           Ambiguous shapes are never guessed into a plan.
+
+        Installer is always the file's ACTUAL staged name (a case-variant
+        asussetup.exe stays lowercase) so the execution path resolves on
+        case-sensitive filesystems too.
+
+        Plans are ordered by folder path. Returns
+        @{ Plans; SkippedFolders }; both fields are always arrays.
+
+        A missing Root, or a Root that is not a directory, throws: the
+        pattern engine never invents installers (Invoke-DriverPhase catches
+        this and reports it as a failed-driver entry instead of letting it
+        escape the phase boundary).
+
+        No manifest file is ever read - discovery inspects file NAMES only.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Root
+    )
+    if (-not (Test-Path -LiteralPath $Root)) {
+        throw ("Driver root not found at '{0}'. The pattern engine never invents installers." -f $Root)
+    }
+    $rootItem = Get-Item -LiteralPath $Root -Force
+    if (-not $rootItem.PSIsContainer) {
+        throw ("Driver root '{0}' is not a directory." -f $Root)
+    }
+    # Every directory at or below the root is a candidate folder; processing
+    # them in FullName order makes the plan list ordered by folder path.
+    $folders = @($rootItem) + @(Get-ChildItem -LiteralPath $Root -Directory -Recurse -Force)
+    $plans = @()
+    $skipped = @()
+    foreach ($folder in ($folders | Sort-Object -Property FullName)) {
+        $direct = @(Get-ChildItem -LiteralPath $folder.FullName -File -Force |
+            Where-Object { $_.Extension -ieq '.exe' })
+        $asus = @($direct | Where-Object { $_.Name -ieq 'AsusSetup.exe' })
+        if ($asus.Count -gt 0) {
+            $plans += @{ Folder = $folder.FullName; Installer = $asus[0].Name; Pattern = 'Asus' }
+            continue
+        }
+        if ($direct.Count -eq 1) {
+            # Single direct installer: a plan only when nothing installable
+            # hides below it (the Gigabyte single-exe convention).
+            $allBelow = @(Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -Force |
+                Where-Object { $_.Extension -ieq '.exe' })
+            if ($allBelow.Count -le 1) {
+                $plans += @{ Folder = $folder.FullName; Installer = $direct[0].Name; Pattern = 'SingleExe' }
+            }
+            else {
+                $skipped += @{ Folder = $folder.FullName; Reason = 'NestedInstaller' }
+            }
+            continue
+        }
+        if ($direct.Count -eq 0) {
+            $skipped += @{ Folder = $folder.FullName; Reason = 'NoInstaller' }
+        }
+        else {
+            $skipped += @{ Folder = $folder.FullName; Reason = 'MultipleInstallers' }
+        }
+    }
+    return @{ Plans = @($plans); SkippedFolders = @($skipped) }
+}
+
+function Invoke-DriverPhase {
+    <#
+        .SYNOPSIS
+        Executes the pattern-discovered driver installers, with a dry-run
+        mode and per-driver failure reporting (Q96/Q27).
+
+        .DESCRIPTION
+        Discovery (Find-DriverInstallers) runs first, inside try/catch:
+        even a discovery failure - including a missing Root - is REPORTED,
+        never thrown past this function (Q27: a driver problem does not
+        kill the deployment; the phase never throws).
+
+        -DryRun records the discovered plan list in the result's Plans
+        field and executes NOTHING: the Runner is never invoked, and the
+        recorded plan list is identical to Find-DriverInstallers output.
+
+        Execution: each plan is handed to the Runner in plan order. The
+        Runner receives the PLAN OBJECT (@{ Folder; Installer; Pattern } -
+        design choice: the plan carries the pattern, so a runner can pick
+        per-vendor behavior) and signals failure by throwing, by returning
+        boolean $false (the module-wide action convention), or by returning
+        an object with a non-zero ExitCode (the Start-Process -PassThru
+        shape; every non-zero code counts - the strict non-zero contract).
+        A failed driver NEVER stops the remaining plans: every plan is
+        attempted and failures are collected.
+
+        Default Runner (used when -Runner is omitted): real silent
+        execution - Start-Process -FilePath <Folder>\<Installer>
+        -ArgumentList '-s' -Wait -PassThru - for BOTH patterns. '-s' is the
+        ASUS silent switch the plan mandates; real-world per-vendor
+        switches arrive with the driver library and will be selected by
+        Pattern then. Manufacturer installers run silently over the staged
+        folders; the separate recursive PnP pass and final device
+        validation are Q28 work, not this phase.
+
+        Returns @{ Ok; DryRun; Plans; Executed; FailedDrivers; SkippedFolders }:
+        - Ok = $true only when no driver failed;
+        - Plans = the full discovered plan list (the dry-run record);
+        - Executed = the plans that ran successfully;
+        - FailedDrivers = @{ Folder; Installer; Error } per failed driver
+          (a discovery failure is a single entry with Installer = $null);
+        - SkippedFolders = the discovery report, carried through;
+        - RoutedToReview = $true is added exactly when Ok = $false (Q27:
+          unresolved driver failures are routed to Technician Review before
+          the final handoff - the phase reports and keeps going; it never
+          throws and never aborts the deployment itself).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Root,
+        [switch]$DryRun,
+        [scriptblock]$Runner
+    )
+    $runner = $Runner
+    if ($null -eq $runner) {
+        $runner = {
+            param($Plan)
+            $installerPath = Join-Path $Plan.Folder $Plan.Installer
+            return (Start-Process -FilePath $installerPath -ArgumentList '-s' -Wait -PassThru)
+        }
+    }
+    try {
+        $found = Find-DriverInstallers -Root $Root
+    }
+    catch {
+        # Q27: reported, not thrown - the phase result itself never throws.
+        return @{
+            Ok             = $false
+            DryRun         = [bool]$DryRun
+            Plans          = @()
+            Executed       = @()
+            FailedDrivers  = @(@{ Folder = $Root; Installer = $null; Error = $_.Exception.Message })
+            SkippedFolders = @()
+            RoutedToReview = $true
+        }
+    }
+    if ($DryRun) {
+        return @{
+            Ok             = $true
+            DryRun         = $true
+            Plans          = @($found.Plans)
+            Executed       = @()
+            FailedDrivers  = @()
+            SkippedFolders = @($found.SkippedFolders)
+        }
+    }
+    $executed = @()
+    $failed = @()
+    foreach ($plan in @($found.Plans)) {
+        $runError = $null
+        $output = $null
+        try { $output = & $runner $plan }
+        catch { $runError = $_.Exception.Message }
+        if ($null -eq $runError) {
+            if ($output -is [bool] -and $output -eq $false) {
+                $runError = 'Runner returned $false.'
+            }
+            elseif ($null -ne $output) {
+                $exitProp = $output.PSObject.Properties['ExitCode']
+                if ($null -ne $exitProp -and [int]$exitProp.Value -ne 0) {
+                    $runError = ('Installer exited with code {0}.' -f $exitProp.Value)
+                }
+            }
+        }
+        if ($null -ne $runError) {
+            $failed += @{ Folder = $plan.Folder; Installer = $plan.Installer; Error = $runError }
+        }
+        else {
+            $executed += $plan
+        }
+    }
+    $result = @{
+        Ok             = (@($failed).Count -eq 0)
+        DryRun         = $false
+        Plans          = @($found.Plans)
+        Executed       = @($executed)
+        FailedDrivers  = @($failed)
+        SkippedFolders = @($found.SkippedFolders)
+    }
+    if (@($failed).Count -gt 0) { $result['RoutedToReview'] = $true }
+    return $result
+}

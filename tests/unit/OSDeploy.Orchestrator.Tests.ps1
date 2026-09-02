@@ -43,6 +43,37 @@ BeforeAll {
             Acknowledgements = @()
         }
     }
+
+    # Task 21: staged driver-tree fixture covering every classification shape
+    # the Q96 pattern engine must decide: exact-name and case-variant
+    # AsusSetup.exe folders, a single-exe Gigabyte-style folder, an uppercase
+    # .EXE extension, an empty folder, a two-installer folder, and a folder
+    # whose single installer has another installer nested below it (whose own
+    # subfolder is a clean SingleExe). Probed on this host: PowerShell builds
+    # real nested directories from backslash-joined paths on every platform,
+    # so the tree is identical on Windows and Linux.
+    function New-DriverTree {
+        $treeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('drivers-' + [guid]::NewGuid().ToString('N'))
+        foreach ($dir in @(
+            (Join-Path $treeRoot 'Asus\PRIME\Chipset'),
+            (Join-Path $treeRoot 'Asus\AUDIO'),
+            (Join-Path $treeRoot 'Gigabyte\B650\LAN'),
+            (Join-Path $treeRoot 'Upper'),
+            (Join-Path $treeRoot 'Empty'),
+            (Join-Path $treeRoot 'Multi'),
+            (Join-Path $treeRoot 'Nested\sub'))) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Asus\PRIME\Chipset\AsusSetup.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Asus\AUDIO\asussetup.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Gigabyte\B650\LAN\installer.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Upper\SETUP.EXE'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Multi\a.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Multi\b.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Nested\outer.exe'), 'dummy')
+        [System.IO.File]::WriteAllText((Join-Path $treeRoot 'Nested\sub\inner.exe'), 'dummy')
+        return $treeRoot
+    }
 }
 AfterAll {
     # Release the single-instance lock exactly as the brief prescribes so no
@@ -873,5 +904,190 @@ Describe 'Invoke-PostCompletionRestart cleanup-only restart (Q89)' {
         $r.Ok | Should -BeFalse
         @($r.Failures).Count | Should -Be 1
         (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Task 21: driver phase - pattern-matched discovery with dry-run (Q96/Q27).
+# None of these tests needs the single-instance lock or an orchestration
+# context. Each test stages its own driver tree (New-DriverTree in the
+# file-level BeforeAll); no real installer is ever launched - execution
+# tests inject a recording Runner, and the default-runner test MOCKS
+# Start-Process in module scope.
+# ---------------------------------------------------------------------------
+
+Describe 'Find-DriverInstallers pattern engine (Q96)' {
+    BeforeEach {
+        $script:tree = New-DriverTree
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:tree -ErrorAction SilentlyContinue
+    }
+    It 'classifies Asus (exact and case-variant names) and SingleExe folders into folder-ordered plans' {
+        $r = Find-DriverInstallers -Root $script:tree
+        (@($r.Plans | ForEach-Object { $_.Pattern }) -join ',') | Should -Be 'Asus,Asus,SingleExe,SingleExe,SingleExe'
+        # Installer is always the staged file's ACTUAL name, so the execution
+        # path still resolves on case-sensitive filesystems.
+        (@($r.Plans | ForEach-Object { $_.Installer }) -join ',') |
+            Should -Be 'asussetup.exe,AsusSetup.exe,installer.exe,inner.exe,SETUP.EXE'
+        # Plans are ordered by folder path.
+        $r.Plans[0].Folder | Should -BeLike ('*' + (Join-Path 'Asus' 'AUDIO'))
+        $r.Plans[1].Folder | Should -BeLike ('*' + (Join-Path 'Asus' 'PRIME\Chipset'))
+        $r.Plans[2].Folder | Should -BeLike ('*' + (Join-Path 'Gigabyte' 'B650\LAN'))
+        $r.Plans[3].Folder | Should -BeLike ('*' + (Join-Path 'Nested' 'sub'))
+        $r.Plans[4].Folder | Should -BeLike ('*Upper')
+    }
+    It 'records every folder without a plan in SkippedFolders with its reason' {
+        $r = Find-DriverInstallers -Root $script:tree
+        $reasonByFolder = @{}
+        foreach ($s in @($r.SkippedFolders)) { $reasonByFolder[$s.Folder] = $s.Reason }
+        # 13 candidate folders at or below the root, 5 with plans: 8 skipped.
+        @($r.SkippedFolders).Count | Should -Be 8
+        # The tree root itself and every intermediate parent hold no direct
+        # installer, so they are reported with the NoInstaller reason.
+        $reasonByFolder[$script:tree] | Should -Be 'NoInstaller'
+        $reasonByFolder[(Join-Path $script:tree 'Asus')] | Should -Be 'NoInstaller'
+        $reasonByFolder[(Join-Path $script:tree 'Gigabyte\B650')] | Should -Be 'NoInstaller'
+        $reasonByFolder[(Join-Path $script:tree 'Empty')] | Should -Be 'NoInstaller'
+        $reasonByFolder[(Join-Path $script:tree 'Multi')] | Should -Be 'MultipleInstallers'
+        # One direct installer but another one below it: ambiguous, never guessed.
+        $reasonByFolder[(Join-Path $script:tree 'Nested')] | Should -Be 'NestedInstaller'
+    }
+    It 'classifies the staged mock partition Drivers tree: one Asus plan and one SingleExe plan' {
+        $r = Find-DriverInstallers -Root (Join-Path $root 'Sources\Drivers')
+        (@($r.Plans | ForEach-Object { $_.Pattern }) -join ',') | Should -Be 'Asus,SingleExe'
+        (@($r.Plans | ForEach-Object { $_.Installer }) -join ',') | Should -Be 'AsusSetup.exe,installer.exe'
+        $r.Plans[0].Folder | Should -BeLike ('*' + (Join-Path 'Drivers' 'Asus\PRIME\Chipset'))
+        $r.Plans[1].Folder | Should -BeLike ('*' + (Join-Path 'Drivers' 'Gigabyte\B650\LAN'))
+        @($r.SkippedFolders).Count | Should -Be 5
+        @($r.SkippedFolders | Where-Object { $_.Reason -ne 'NoInstaller' }).Count | Should -Be 0
+    }
+    It 'yields exactly one plan when Root points directly at a single driver folder' {
+        $chipset = Join-Path $script:tree 'Asus\PRIME\Chipset'
+        $r = Find-DriverInstallers -Root $chipset
+        @($r.Plans).Count | Should -Be 1
+        $r.Plans[0].Folder | Should -Be $chipset
+        $r.Plans[0].Installer | Should -Be 'AsusSetup.exe'
+        $r.Plans[0].Pattern | Should -Be 'Asus'
+        @($r.SkippedFolders).Count | Should -Be 0
+    }
+    It 'reads no manifest file: identical output with junk manifests present and absent (Q96)' {
+        $manifestAtRoot = Join-Path $script:tree 'manifest.json'
+        $manifestNested = Join-Path $script:tree 'Asus\PRIME\manifest.json'
+        # Invalid JSON on purpose: any attempt to read AND parse a manifest
+        # would throw and fail this test outright.
+        [System.IO.File]::WriteAllText($manifestAtRoot, '{{ this is not json')
+        [System.IO.File]::WriteAllText($manifestNested, '{{ this is not json')
+        $withManifests = Find-DriverInstallers -Root $script:tree
+        @($withManifests.Plans).Count | Should -Be 5
+        $project = {
+            param($Found)
+            (@($Found.Plans | ForEach-Object { '{0}|{1}|{2}' -f $_.Folder, $_.Installer, $_.Pattern }) -join ';') + '##' +
+                (@($Found.SkippedFolders | ForEach-Object { '{0}|{1}' -f $_.Folder, $_.Reason }) -join ';')
+        }
+        $before = & $project $withManifests
+        Remove-Item -LiteralPath $manifestAtRoot, $manifestNested -Force
+        $withoutManifests = Find-DriverInstallers -Root $script:tree
+        (& $project $withoutManifests) | Should -Be $before
+        # A manifest is never mistaken for an installer either way.
+        @($withoutManifests.Plans | Where-Object { $_.Installer -match 'manifest' }).Count | Should -Be 0
+    }
+    It 'throws when the Root does not exist or is not a directory (fail closed)' {
+        { Find-DriverInstallers -Root (Join-Path $script:tree 'DoesNotExist') } | Should -Throw
+        { Find-DriverInstallers -Root (Join-Path $script:tree 'Multi\a.exe') } | Should -Throw
+    }
+}
+
+Describe 'Invoke-DriverPhase execution, dry-run, and failure routing (Q27)' {
+    BeforeEach {
+        $script:tree = New-DriverTree
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:tree -ErrorAction SilentlyContinue
+    }
+    It 'dry-run returns the identical plan list with zero Runner invocations and executes nothing' {
+        $script:invocations = 0
+        $found = Find-DriverInstallers -Root $script:tree
+        $runner = { param($Plan) $script:invocations++; return $true }
+        $r = Invoke-DriverPhase -Root $script:tree -DryRun -Runner $runner
+        $r.DryRun | Should -BeTrue
+        $r.Ok | Should -BeTrue
+        $script:invocations | Should -Be 0
+        @($r.Executed).Count | Should -Be 0
+        @($r.FailedDrivers).Count | Should -Be 0
+        # The recorded plan list is IDENTICAL to the discovery result.
+        $expected = (@($found.Plans | ForEach-Object { '{0}|{1}|{2}' -f $_.Folder, $_.Installer, $_.Pattern }) -join ';')
+        $actual = (@($r.Plans | ForEach-Object { '{0}|{1}|{2}' -f $_.Folder, $_.Installer, $_.Pattern }) -join ';')
+        $actual | Should -Be $expected
+        @($r.SkippedFolders).Count | Should -Be @($found.SkippedFolders).Count
+        # Nothing failed, so no review routing rides along.
+        @($r.Keys) -contains 'RoutedToReview' | Should -BeFalse
+    }
+    It 'a throwing Runner fails exactly that driver while every other plan still runs, routed to review' {
+        $script:ran = @()
+        $runner = {
+            param($Plan)
+            $script:ran += $Plan.Installer
+            if ($Plan.Installer -eq 'installer.exe') { throw 'LAN installer crashed' }
+        }
+        $r = Invoke-DriverPhase -Root $script:tree -Runner $runner
+        $r.Ok | Should -BeFalse
+        $r.DryRun | Should -BeFalse
+        $r.RoutedToReview | Should -BeTrue
+        # Every plan was attempted; one failure never stops the others (Q27).
+        @($script:ran).Count | Should -Be 5
+        @($script:ran | Where-Object { $_ -eq 'installer.exe' }).Count | Should -Be 1
+        @($r.FailedDrivers).Count | Should -Be 1
+        $r.FailedDrivers[0].Installer | Should -Be 'installer.exe'
+        $r.FailedDrivers[0].Folder | Should -BeLike ('*' + (Join-Path 'Gigabyte' 'B650\LAN'))
+        $r.FailedDrivers[0].Error | Should -Match 'LAN installer crashed'
+        @($r.Executed).Count | Should -Be 4
+        @($r.Executed | Where-Object { $_.Installer -eq 'installer.exe' }).Count | Should -Be 0
+    }
+    It 'a non-zero installer exit code fails that driver' {
+        $runner = {
+            param($Plan)
+            if ($Plan.Installer -eq 'SETUP.EXE') { return [pscustomobject]@{ ExitCode = 2 } }
+            return $true
+        }
+        $r = Invoke-DriverPhase -Root $script:tree -Runner $runner
+        $r.Ok | Should -BeFalse
+        $r.RoutedToReview | Should -BeTrue
+        @($r.FailedDrivers).Count | Should -Be 1
+        $r.FailedDrivers[0].Installer | Should -Be 'SETUP.EXE'
+        $r.FailedDrivers[0].Error | Should -Match 'exited with code 2'
+        @($r.Executed).Count | Should -Be 4
+    }
+    It 'never throws: a missing driver root is reported and routed to review' {
+        $missing = Join-Path $script:tree 'DoesNotExist'
+        $script:missingResult = $null
+        { $script:missingResult = Invoke-DriverPhase -Root $missing -DryRun } | Should -Not -Throw
+        $script:missingResult.Ok | Should -BeFalse
+        $script:missingResult.DryRun | Should -BeTrue
+        $script:missingResult.RoutedToReview | Should -BeTrue
+        @($script:missingResult.FailedDrivers).Count | Should -Be 1
+        $script:missingResult.FailedDrivers[0].Installer | Should -BeNullOrEmpty
+        $script:missingResult.FailedDrivers[0].Error | Should -Match 'DoesNotExist'
+        @($script:missingResult.Executed).Count | Should -Be 0
+    }
+    It 'the default runner silently invokes Start-Process once per plan with the -s ASUS convention' {
+        Mock Start-Process -ModuleName OSDeploy.Orchestrator { return [pscustomobject]@{ ExitCode = 0 } }
+        $r = Invoke-DriverPhase -Root $script:tree
+        $r.Ok | Should -BeTrue
+        $r.DryRun | Should -BeFalse
+        @($r.Executed).Count | Should -Be 5
+        @($r.FailedDrivers).Count | Should -Be 0
+        Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 5 -ParameterFilter { $ArgumentList -eq '-s' } -Scope It
+        Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 1 -ParameterFilter {
+            $FilePath -like ('*' + (Join-Path 'Gigabyte' 'B650\LAN\installer.exe')) -and $ArgumentList -eq '-s'
+        } -Scope It
+    }
+    It 'never references autoAll.ps1 or eztConfig.ps1 (Q95)' {
+        # Comment-stripped code scan, the same convention the static gates
+        # use for banned constructs: documenting the prohibition in a
+        # comment must not trip the lock, but any CODE reference fails it.
+        $psm1Path = Join-Path (Split-Path -Parent $modulePath) 'OSDeploy.Orchestrator.psm1'
+        $codeLines = @((Get-Content -LiteralPath $psm1Path) | ForEach-Object { ($_ -split '#')[0] })
+        ($codeLines -join "`n") | Should -Not -Match '(?i)autoall|eztconfig'
     }
 }
