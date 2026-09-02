@@ -713,3 +713,290 @@ function Repair-FromLocalSource {
     }
     return @{ Repaired = $false; Outcome = 'TechnicianReview' }
 }
+
+# ---------------------------------------------------------------------------
+# Completion gating and scoped cleanup (Q89)
+# ---------------------------------------------------------------------------
+
+# Mock/deployment locations this suite addresses (documented contract):
+#   <PartitionRoot>\State\TaskRegistration.json  the Scheduled Task
+#       registration MARKER that Task 28's Register-OrchestratorTask writes.
+#       Removing the marker is how a finished run retires its startup-task
+#       re-entry; the path is defined here, next to its consumer, so
+#       registration and cleanup can never drift apart.
+#   <PartitionRoot>\OrchestratorRuntime\          the runtime artifacts
+#       directory. In the deployed Windows host this represents
+#       C:\ProgramData\OSDeploy\Orchestrator; the engine addresses it
+#       relative to the partition so the suite stays platform-independent
+#       and the tests can stage it as plain files.
+
+# Internal: set one field on a hashtable (in-memory) OR PSCustomObject
+# (ConvertFrom-Json) state record. The completion fields Completed, BlockedBy,
+# and CompletedUtc do not exist on a record read back from
+# DeploymentState.json, and PSCustomObject assignment to a MISSING property
+# throws (probed on pwsh 7.4.2: 'The property cannot be found on this
+# object'), so new fields are added with Add-Member while existing fields are
+# assigned in place.
+function Set-OrchestratorField {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string]$Name,
+        $Value
+    )
+    if ($Record -is [System.Collections.IDictionary]) {
+        $Record[$Name] = $Value
+        return
+    }
+    $prop = $Record.PSObject.Properties[$Name]
+    if ($null -ne $prop) {
+        $prop.Value = $Value
+        return
+    }
+    Add-Member -InputObject $Record -MemberType NoteProperty -Name $Name -Value $Value
+}
+
+# Internal: locate the CURRENT (newest) run folder under a Logs root. Uses the
+# same ordering key Invoke-LogRetention uses: the <yyyyMMdd-HHmmss> timestamp
+# embedded in the folder name, LastWriteTime as the fallback for foreign
+# names. Returns a log-shaped @{ Folder; EventsPath } object for the newest
+# folder, or $null when the root or its set of run folders is empty - the
+# caller decides what a missing log means (Task 20: a log-verification block,
+# never an invented log).
+function Get-CurrentRunLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LogsRoot
+    )
+    if (-not (Test-Path -LiteralPath $LogsRoot)) { return $null }
+    $folders = @(Get-ChildItem -LiteralPath $LogsRoot -Directory -ErrorAction SilentlyContinue)
+    if ($folders.Count -eq 0) { return $null }
+    $best = $null
+    $bestKey = ''
+    foreach ($folder in $folders) {
+        $key = $folder.LastWriteTime.ToString('yyyyMMdd-HHmmss')
+        $match = [regex]::Match($folder.Name, '(\d{8}-\d{6})')
+        if ($match.Success) { $key = $match.Groups[1].Value }
+        if ($null -eq $best -or $key -gt $bestKey -or ($key -eq $bestKey -and $folder.Name -gt $best.Name)) {
+            $best = $folder
+            $bestKey = $key
+        }
+    }
+    return @{
+        Folder     = $best.FullName
+        EventsPath = (Join-Path $best.FullName 'events.jsonl')
+    }
+}
+
+function Invoke-Cleanup {
+    <#
+        .SYNOPSIS
+        Q89 scoped cleanup: remove the completion runtime footprint, retain
+        all recovery content.
+
+        .DESCRIPTION
+        Removes EXACTLY two targets and nothing else:
+        1. The Scheduled Task registration marker
+           <PartitionRoot>\State\TaskRegistration.json (the file Task 28's
+           Register-OrchestratorTask writes).
+        2. The orchestrator runtime artifacts directory
+           <PartitionRoot>\OrchestratorRuntime\ entirely (the simulated
+           C:\ProgramData\OSDeploy\Orchestrator).
+
+        NEVER touched: Sources, ImageCache, State\FactoryProfile*,
+        State\effective-config*, Logs, and every other partition path. The
+        function never enumerates the partition - it addresses only the two
+        named targets - so the retained recovery set is structurally safe
+        rather than protected by a filter list.
+
+        Failure contract: a marker path occupied by a DIRECTORY is reported
+        as a removal failure instead of recursed into or prompted about.
+        The marker is a file artifact; unknown directory content squatting
+        on its path is never blindly deleted (probed: Remove-Item without
+        -Recurse on a non-empty directory raises an interactive Confirm
+        prompt, which is not acceptable in an unattended orchestrator).
+        This classification is deterministic on every platform and is how
+        the tests simulate an undeletable marker.
+
+        Returns @{ Ok; Failures }: Ok = $true when both removals succeeded
+        or were already absent (idempotent - an already-clean partition is
+        a success); otherwise $false with one Failures message per failed
+        target. Every target is attempted so one failure never hides
+        another. TaskName only labels the failure detail; it defaults to
+        the same task name Register-OrchestratorTask defaults to.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [string]$TaskName = 'OSDeploy Orchestrator'
+    )
+    $failures = @()
+    $markerPath = Join-Path $PartitionRoot 'State\TaskRegistration.json'
+    $runtimePath = Join-Path $PartitionRoot 'OrchestratorRuntime'
+
+    if (Test-Path -LiteralPath $markerPath) {
+        $markerItem = Get-Item -LiteralPath $markerPath -Force
+        if ($markerItem.PSIsContainer) {
+            $failures += ("Scheduled Task '{0}' registration marker '{1}' is a directory, not the expected marker file; refusing to remove unknown directory content." -f $TaskName, $markerPath)
+        }
+        else {
+            try {
+                Remove-Item -LiteralPath $markerPath -Force -ErrorAction Stop
+            }
+            catch {
+                $failures += ("Scheduled Task '{0}' registration marker '{1}' could not be removed: {2}" -f $TaskName, $markerPath, $_.Exception.Message)
+            }
+        }
+    }
+
+    if (Test-Path -LiteralPath $runtimePath) {
+        try {
+            Remove-Item -LiteralPath $runtimePath -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            $failures += ("Orchestrator runtime artifacts '{0}' could not be removed: {1}" -f $runtimePath, $_.Exception.Message)
+        }
+    }
+
+    return @{ Ok = ($failures.Count -eq 0); Failures = @($failures) }
+}
+
+function Complete-Deployment {
+    <#
+        .SYNOPSIS
+        Q89 completion gate: required work -> cleanup -> final-log
+        verification -> correct handoff, in exactly that order.
+
+        .DESCRIPTION
+        Completion is recorded ONLY after every preceding step succeeds.
+        The state file on the partition is the only state source (it is
+        read here, not taken from any in-memory context).
+
+        Step 1 - required work. State\DeploymentState.json must exist,
+        parse, and pass Test-DeploymentState; a missing or invalid file
+        throws (state is never invented - the same fail-closed rule as
+        Enter-Orchestrator). When Result is already set the run completed
+        earlier and this call is a post-completion restart: it delegates to
+        Invoke-PostCompletionRestart and returns that cleanup result
+        (@{ Ok; Failures }). With -RequiredPhases bound, every listed phase
+        must appear in CompletedPhases or the call returns
+        @{ Completed = $false; BlockedBy = 'RequiredWorkIncomplete' }
+        BEFORE any destructive step and without a state write; with it
+        unbound, the invocation itself is the caller's assertion that the
+        required work is done (the checkpoint is still read and validated).
+
+        Step 2 - cleanup. An Invoke-Cleanup failure checkpoints
+        Completed = $false and BlockedBy = 'CleanupFailure' (Result stays
+        null and NO CompletedUtc is written) and returns the same shape, so
+        a restart retries the full order - cleanup is idempotent.
+
+        Step 3 - final-log verification. Complete-RunLog runs on the
+        CURRENT run log (the newest run folder under
+        <PartitionRoot>\Logs). No run folder at all, an unreadable events
+        file, or a failed JSONL parse gate returns
+        @{ Completed = $false; BlockedBy = 'LogVerification' } with the
+        checkpoint untouched, so the next invocation retries.
+
+        Step 4 - only then: Result = Handoff and CompletedUtc (an ISO 8601
+        UTC string) are written through New-Checkpoint (validated, atomic)
+        and @{ Completed = $true; Result } is returned.
+
+        CompletedUtc is NEVER written on a blocked path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [Parameter(Mandatory)][string]$Handoff,
+        [string[]]$RequiredPhases = @()
+    )
+    $statePath = Join-Path $PartitionRoot 'State\DeploymentState.json'
+    if (-not (Test-Path -LiteralPath $statePath)) {
+        throw ("DeploymentState.json not found at '{0}'. The orchestrator never invents state; verify partition staging." -f $statePath)
+    }
+    try {
+        $state = Read-JsonFile -Path $statePath
+    }
+    catch {
+        throw ("DeploymentState.json at '{0}' could not be parsed: {1}" -f $statePath, $_.Exception.Message)
+    }
+    $validation = Test-DeploymentState -Record $state
+    if (-not $validation.Valid) {
+        throw ("DeploymentState.json at '{0}' failed its contract: {1}" -f $statePath, ($validation.Errors -join '; '))
+    }
+
+    # Post-completion: Result already recorded -> cleanup only, nothing else.
+    $recordedResult = Get-OrchestratorField -Record $state -Name 'Result'
+    $resultIsSet = ($null -ne $recordedResult)
+    if ($resultIsSet -and $recordedResult -is [string] -and $recordedResult -eq '') {
+        $resultIsSet = $false
+    }
+    if ($resultIsSet) {
+        return (Invoke-PostCompletionRestart -PartitionRoot $PartitionRoot)
+    }
+
+    if (@($RequiredPhases).Count -gt 0) {
+        $completed = Get-CompletedPhases -State $state
+        foreach ($required in $RequiredPhases) {
+            if ($completed -notcontains $required) {
+                return @{ Completed = $false; BlockedBy = 'RequiredWorkIncomplete' }
+            }
+        }
+    }
+
+    $cleanup = Invoke-Cleanup -PartitionRoot $PartitionRoot
+    if (-not $cleanup.Ok) {
+        # Durable block record: a restart must see WHY completion never
+        # happened. Result stays null so the retry runs the full order again.
+        Set-OrchestratorField -Record $state -Name 'Completed' -Value $false
+        Set-OrchestratorField -Record $state -Name 'BlockedBy' -Value 'CleanupFailure'
+        $null = New-Checkpoint -State $state -Path $statePath
+        return @{ Completed = $false; BlockedBy = 'CleanupFailure' }
+    }
+
+    $log = Get-CurrentRunLog -LogsRoot (Join-Path $PartitionRoot 'Logs')
+    $logOk = $false
+    if ($null -ne $log) {
+        try {
+            $logOk = Complete-RunLog -Log $log
+        }
+        catch {
+            # An unreadable events file is a verification failure, never a
+            # thrown exception past the completion gate.
+            $logOk = $false
+        }
+    }
+    if (-not $logOk) {
+        # Per the Task 20 contract the log-verification block is returned
+        # without a state write: the checkpoint is untouched, so the next
+        # invocation retries the whole order (cleanup is idempotent).
+        return @{ Completed = $false; BlockedBy = 'LogVerification' }
+    }
+
+    Set-OrchestratorField -Record $state -Name 'Result' -Value $Handoff
+    Set-OrchestratorField -Record $state -Name 'CompletedUtc' -Value (Get-Date).ToUniversalTime().ToString('o')
+    $null = New-Checkpoint -State $state -Path $statePath
+    return @{ Completed = $true; Result = $Handoff }
+}
+
+function Invoke-PostCompletionRestart {
+    <#
+        .SYNOPSIS
+        Q89 post-completion restart: cleanup ONLY.
+
+        .DESCRIPTION
+        A restart after completion runs CLEANUP ONLY - Q89. No phase action
+        is invoked and no state field (Result, CompletedUtc, or any other)
+        is read into the engine or rewritten: the function is structurally
+        incapable of phase work because it accepts no phase, action, or
+        state parameters at all. Returns the Invoke-Cleanup result
+        (@{ Ok; Failures }) unchanged, so a cleanup failure on the
+        post-completion path surfaces as Ok = $false without inventing a
+        completion-shaped answer.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [string]$TaskName = 'OSDeploy Orchestrator'
+    )
+    return (Invoke-Cleanup -PartitionRoot $PartitionRoot -TaskName $TaskName)
+}

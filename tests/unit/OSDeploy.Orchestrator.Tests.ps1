@@ -1,6 +1,9 @@
 BeforeAll {
     # Mock partition builder (dot-sourced script; imports State/Util/Config).
     . (Join-Path $PSScriptRoot '..\mocks\New-MockPartition.ps1')
+    # Logging is imported INSIDE the Orchestrator module, so its functions are
+    # not in the test session; Task 20 fixtures stage run logs directly.
+    Import-Module (Join-Path $PSScriptRoot '..\..\src\Shared\OSDeploy.Logging\OSDeploy.Logging.psd1') -Force
     $script:modulePath = Join-Path $PSScriptRoot '..\..\src\Orchestrator\OSDeploy.Orchestrator.psd1'
     Import-Module $script:modulePath -Force
     $script:root = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-' + [guid]::NewGuid().ToString('N')))
@@ -576,5 +579,261 @@ Describe 'Repair-FromLocalSource local-only repair and the Q91 parameter boundar
         $r.Repaired | Should -BeFalse
         $r.Outcome | Should -Be 'TechnicianReview'
         @(Get-ChildItem -LiteralPath $script:engineDir -Force).Count | Should -Be 0
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Task 20: completion gating and scoped cleanup (Q89). Every test builds its
+# OWN fresh mock partition so removal assertions never disturb the shared
+# fixture, and none of these tests needs the single-instance lock or an
+# orchestration context (Complete-Deployment reads the checkpoint file, which
+# is the only state source).
+#
+# Mock locations (documented per the brief):
+#   - Scheduled Task registration marker: <root>\State\TaskRegistration.json,
+#     staged as the JSON file Task 28's Register-OrchestratorTask will write.
+#   - Orchestrator runtime artifacts: <root>\OrchestratorRuntime\ (the
+#     simulated C:\ProgramData\OSDeploy\Orchestrator), staged with NESTED
+#     content so the recursive removal path is exercised.
+#   - Cleanup-failure simulation: a NON-EMPTY DIRECTORY planted at the
+#     marker path. Invoke-Cleanup classifies 'a directory where the marker
+#     FILE is expected' as a removal failure - it never recurses into
+#     unknown content and never prompts - which is deterministic on Linux
+#     AND Windows (probed: Remove-Item without -Recurse on a non-empty
+#     directory raises an interactive Confirm prompt, which is not a
+#     reliable test signal; a read-only bit is bypassed under -Force and
+#     ignored by root, so permission tricks are not reliable either).
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-Cleanup scoped removal and recovery retention (Q89)' {
+    BeforeEach {
+        $script:troot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-cln-' + [guid]::NewGuid().ToString('N')))
+        # Completion footprint: the task registration marker file, the
+        # runtime artifacts tree, and a State-side effective-config copy
+        # (the retained set names State\effective-config* in addition to the
+        # Sources\Config copy the mock partition stages).
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'OrchestratorRuntime\Cache') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $script:troot 'OrchestratorRuntime\RuntimeMarker.txt'), 'runtime')
+        [System.IO.File]::WriteAllText((Join-Path $script:troot 'OrchestratorRuntime\Cache\deep.txt'), 'nested')
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\effective-config.json') -Value @{ ConfigVersion = 'test-v1' }
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:troot -ErrorAction SilentlyContinue
+    }
+    It 'removes the task registration marker and the runtime artifacts directory and nothing else' {
+        $r = Invoke-Cleanup -PartitionRoot $script:troot
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+        # Recovery content is ALWAYS retained: every named path survives.
+        foreach ($retained in @(
+            'Sources\Orchestrator\Part1.psm1',
+            'Sources\Orchestrator\Part2.psm1',
+            'Sources\Apps\EZT\manifest.json',
+            'Sources\Apps\MMC\manifest.json',
+            'Sources\Drivers\Asus\PRIME\Chipset\AsusSetup.exe',
+            'Sources\Drivers\Gigabyte\B650\LAN\installer.exe',
+            'Sources\Config\effective-config.json',
+            'ImageCache',
+            'State\FactoryProfile.json',
+            'State\FactoryProfile.lastknowngood.json',
+            'State\effective-config.json',
+            'State\DeploymentState.json',
+            'State\ReadinessRecord.json',
+            'Logs')) {
+            Test-Path -LiteralPath (Join-Path $script:troot $retained) | Should -BeTrue
+        }
+    }
+    It 'is idempotent: an already-clean partition returns Ok with an empty failure list' {
+        $first = Invoke-Cleanup -PartitionRoot $script:troot
+        $first.Ok | Should -BeTrue
+        $second = Invoke-Cleanup -PartitionRoot $script:troot
+        $second.Ok | Should -BeTrue
+        @($second.Failures).Count | Should -Be 0
+    }
+    It 'reports Ok=$false with a Failures list when the marker path holds a directory instead of the marker file' {
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $r = Invoke-Cleanup -PartitionRoot $script:troot
+        $r.Ok | Should -BeFalse
+        @($r.Failures).Count | Should -Be 1
+        $r.Failures[0] | Should -Match 'TaskRegistration\.json'
+        # Every target is attempted: one failure never hides the other removal.
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+        # Nothing retained was touched by the failed cleanup.
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\FactoryProfile.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:troot 'Sources\Config\effective-config.json') | Should -BeTrue
+    }
+    It 'carries the task name in the failure detail: default and caller-supplied' {
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $default = Invoke-Cleanup -PartitionRoot $script:troot
+        $default.Failures[0] | Should -Match ([regex]::Escape('OSDeploy Orchestrator'))
+        $named = Invoke-Cleanup -PartitionRoot $script:troot -TaskName 'Custom Task 99'
+        $named.Failures[0] | Should -Match ([regex]::Escape('Custom Task 99'))
+    }
+}
+
+Describe 'Complete-Deployment Q89 completion gating' {
+    BeforeEach {
+        $script:troot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-fin-' + [guid]::NewGuid().ToString('N')))
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'OrchestratorRuntime\Cache') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $script:troot 'OrchestratorRuntime\RuntimeMarker.txt'), 'runtime')
+        # A finished run's log: the partition's newest run folder holds
+        # valid JSONL (one event written through the real logging path).
+        $log = New-RunLog -Root (Join-Path $script:troot 'Logs') -RunType 'InitialDeployment'
+        Add-LogEvent -Log $log -Event 'SuiteFixture'
+        $script:eventsPath = $log.EventsPath
+        # The checkpoint of a run whose phases are all complete.
+        $script:statePath = Join-Path $script:troot 'State\DeploymentState.json'
+        $state = Read-JsonFile -Path $script:statePath
+        $state.Phase = 'Audit'
+        $state.CompletedPhases = @('Prepare', 'Drivers', 'Apps', 'Audit')
+        $null = New-Checkpoint -State $state -Path $script:statePath
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:troot -ErrorAction SilentlyContinue
+    }
+    It 'records Result and CompletedUtc only after cleanup and final-log verification succeed' {
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeTrue
+        $r.Result | Should -Be 'Completed'
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Completed,Result'
+        $after = Read-JsonFile -Path $script:statePath
+        $after.Result | Should -Be 'Completed'
+        # CompletedUtc is an ISO 8601 UTC string; asserted on the RAW FILE
+        # TEXT because pwsh 7 auto-types ISO strings to [datetime] on read
+        # (Task 16 note) - and never hardcoded, only shape-matched.
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+        # No block markers on the success path.
+        $after.PSObject.Properties['BlockedBy'] | Should -BeNullOrEmpty
+        $after.PSObject.Properties['Completed'] | Should -BeNullOrEmpty
+        # Cleanup ran, and the verified run log survived it (Logs retained).
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+        Test-Path -LiteralPath $script:eventsPath | Should -BeTrue
+    }
+    It 'blocks on cleanup failure: Completed=$false, BlockedBy=CleanupFailure, and NO CompletedUtc in the state' {
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeFalse
+        $r.BlockedBy | Should -Be 'CleanupFailure'
+        $after = Read-JsonFile -Path $script:statePath
+        $after.PSObject.Properties['CompletedUtc'] | Should -BeNullOrEmpty
+        $after.PSObject.Properties['Completed'].Value | Should -BeFalse
+        $after.BlockedBy | Should -Be 'CleanupFailure'
+        $after.Result | Should -BeNullOrEmpty
+        # The runtime target was still attempted (failures are collected,
+        # never first-abort), so a restart retries the whole order cleanly.
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+    }
+    It 'blocks on final-log verification failure after successful cleanup, leaving the checkpoint untouched' {
+        [System.IO.File]::AppendAllText($script:eventsPath, 'this line is not json' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+        $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeFalse
+        $r.BlockedBy | Should -Be 'LogVerification'
+        # No completion was recorded and the checkpoint is byte-identical.
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Not -Match 'CompletedUtc'
+        # Cleanup already ran BEFORE the log gate (the Q89 order).
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+    }
+    It 'treats a partition with no run log at all as a log-verification block' {
+        Get-ChildItem -LiteralPath (Join-Path $script:troot 'Logs') -Force |
+            Remove-Item -Recurse -Force
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeFalse
+        $r.BlockedBy | Should -Be 'LogVerification'
+        ([System.IO.File]::ReadAllText($script:statePath)) | Should -Not -Match 'CompletedUtc'
+    }
+    It 'throws when DeploymentState.json is missing (state is never invented)' {
+        Remove-Item -LiteralPath $script:statePath -Force
+        { Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed' } | Should -Throw
+    }
+    It 'blocks before any cleanup when a required phase is missing from the checkpoint' {
+        $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed' -RequiredPhases @('Prepare', 'Drivers', 'Apps', 'Audit', 'Summary')
+        $r.Completed | Should -BeFalse
+        $r.BlockedBy | Should -Be 'RequiredWorkIncomplete'
+        # No destructive step ran and no state was written.
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeTrue
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+}
+
+Describe 'Invoke-PostCompletionRestart cleanup-only restart (Q89)' {
+    BeforeEach {
+        $script:troot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-post-' + [guid]::NewGuid().ToString('N')))
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'OrchestratorRuntime') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $script:troot 'OrchestratorRuntime\RuntimeMarker.txt'), 'runtime')
+        # An ALREADY completed run: Result and CompletedUtc were recorded by
+        # an earlier Complete-Deployment call.
+        $script:statePath = Join-Path $script:troot 'State\DeploymentState.json'
+        $state = Read-JsonFile -Path $script:statePath
+        $state.Result = 'Completed'
+        Add-Member -InputObject $state -MemberType NoteProperty -Name 'CompletedUtc' -Value ([datetime]::UtcNow.ToString('o'))
+        $null = New-Checkpoint -State $state -Path $script:statePath
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:troot -ErrorAction SilentlyContinue
+    }
+    It 'performs cleanup with zero phase-action invocations and no state change' {
+        $script:phaseCalls = 0
+        $phaseAction = { $script:phaseCalls++ }
+        $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
+        $r = Invoke-PostCompletionRestart -PartitionRoot $script:troot
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        # No phase action ran: the counter never moved.
+        $script:phaseCalls | Should -Be 0
+        # The state (Result, CompletedUtc, everything) is byte-identical.
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+        # A second restart is equally clean (idempotent).
+        $again = Invoke-PostCompletionRestart -PartitionRoot $script:troot
+        $again.Ok | Should -BeTrue
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+    It 'Complete-Deployment with Result already set delegates to the post-completion restart (cleanup shape, no re-completion)' {
+        $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
+        # Even an unmet required-phase list must not matter: the delegation
+        # happens before any required-work evaluation.
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed' -RequiredPhases @('NeverRan')
+        # The return IS the cleanup result - the cleanup shape, not a
+        # completion shape (no Completed / BlockedBy keys).
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Failures,Ok'
+        $r.Ok | Should -BeTrue
+        # No re-completion: the state still carries exactly the ORIGINAL
+        # Result and CompletedUtc, byte for byte.
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+        Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeFalse
+    }
+    It 'reports a post-completion cleanup failure as-is (cleanup shape, state untouched)' {
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:troot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $before = (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash
+        $r = Invoke-PostCompletionRestart -PartitionRoot $script:troot
+        $r.Ok | Should -BeFalse
+        @($r.Failures).Count | Should -Be 1
+        (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
     }
 }

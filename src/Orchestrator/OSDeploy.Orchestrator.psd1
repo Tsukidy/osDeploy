@@ -3,9 +3,10 @@
     ModuleVersion     = '0.1.0'
     GUID              = '574ce367-30bb-4cc2-9442-a5012d23b6a6'
     Author            = 'OSDeploy Suite'
-    Description       = 'Orchestrator entry, single-instance lock, checkpoint engine, attempt policy, idempotent resume, reboot handling, integrity recheck, and local-only repair.'
+    Description       = 'Orchestrator entry, single-instance lock, checkpoint engine, attempt policy, idempotent resume, reboot handling, integrity recheck, local-only repair, and completion gating with scoped cleanup.'
     PowerShellVersion = '5.1'
     FunctionsToExport = @('Enter-Orchestrator', 'New-Checkpoint', 'Get-ResumePoint', 'Get-OrchestratorMutex',
         'Set-OrchestrationContext', 'Set-OrchestrationRestartRequested', 'Invoke-WithAttempts', 'Invoke-Phase',
-        'Resume-AfterReboot', 'New-IntegrityRecord', 'Test-Integrity', 'Repair-FromLocalSource')
+        'Resume-AfterReboot', 'New-IntegrityRecord', 'Test-Integrity', 'Repair-FromLocalSource',
+        'Invoke-Cleanup', 'Complete-Deployment', 'Invoke-PostCompletionRestart')
 }
