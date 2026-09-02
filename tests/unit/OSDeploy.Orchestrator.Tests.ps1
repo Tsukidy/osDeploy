@@ -44,6 +44,35 @@ BeforeAll {
         }
     }
 
+    # Task 22: manifest-driven application phase fixtures. New-AppEntry
+    # returns a FRESH valid entry on every call (tests mutate their own
+    # copy); New-AppManifest writes the entries as a JSON array into a fresh
+    # temp directory and returns the manifest path. Created directories are
+    # tracked and removed by the Task 22 Describes' AfterEach.
+    $script:appDirs = @()
+    function New-AppEntry {
+        return @{
+            Id             = 'app-1'
+            Name           = 'Sample Utility'
+            Installer      = 'SampleSetup.exe'
+            Type           = 'Exe'
+            SilentArgs     = '/S /norestart'
+            SuccessCodes   = @(0)
+            RetryCount     = 3
+            TimeoutMinutes = 10
+            Required       = $true
+        }
+    }
+    function New-AppManifest {
+        param($Entries)
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('apps-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        $script:appDirs += $dir
+        $path = Join-Path $dir 'manifest.json'
+        Write-AtomicJson -Path $path -Value @($Entries)
+        return $path
+    }
+
     # Task 21: staged driver-tree fixture covering every classification shape
     # the Q96 pattern engine must decide: exact-name and case-variant
     # AsusSetup.exe folders, a single-exe Gigabyte-style folder, an uppercase
@@ -1089,5 +1118,310 @@ Describe 'Invoke-DriverPhase execution, dry-run, and failure routing (Q27)' {
         $psm1Path = Join-Path (Split-Path -Parent $modulePath) 'OSDeploy.Orchestrator.psm1'
         $codeLines = @((Get-Content -LiteralPath $psm1Path) | ForEach-Object { ($_ -split '#')[0] })
         ($codeLines -join "`n") | Should -Not -Match '(?i)autoall|eztconfig'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Task 22: application phase - manifest-driven execution with per-entry
+# retries and the Q26 Acknowledge-and-Continue payload (Q25/Q26). None of
+# these tests needs the single-instance lock or an orchestration context.
+# No real installer is ever launched: execution tests inject a recording
+# FAKE Runner, and the default-runner test MOCKS Start-Process in module
+# scope (the mock returns an already-exited Process shape).
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-ApplicationPhase manifest loading (fail closed)' {
+    AfterEach {
+        foreach ($d in $script:appDirs) {
+            Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+        }
+        $script:appDirs = @()
+    }
+    It 'throws when the manifest file is missing' {
+        $missing = Join-Path $ckDir ('apps-missing-' + [guid]::NewGuid().ToString('N') + '.json')
+        { Invoke-ApplicationPhase -ManifestPath $missing -Runner { param($Context) } } | Should -Throw
+    }
+    It 'throws when the manifest is unparseable JSON' {
+        $garbage = Join-Path $ckDir ('apps-garbage-' + [guid]::NewGuid().ToString('N') + '.json')
+        Set-Content -Path $garbage -Value 'not json at all' -Encoding Ascii
+        { Invoke-ApplicationPhase -ManifestPath $garbage -Runner { param($Context) } } | Should -Throw
+    }
+    It 'throws when the document is valid JSON but not an array of entries' {
+        $object = Join-Path $ckDir ('apps-object-' + [guid]::NewGuid().ToString('N') + '.json')
+        Write-AtomicJson -Path $object -Value @{ Id = 'only'; Name = 'Not An Array' }
+        { Invoke-ApplicationPhase -ManifestPath $object -Runner { param($Context) } } | Should -Throw
+    }
+    It 'throws naming the missing field when an entry lacks one of the nine, before any Runner invocation' {
+        $script:calls = 0
+        $entry = New-AppEntry
+        $null = $entry.Remove('SuccessCodes')
+        $path = New-AppManifest -Entries @($entry)
+        $err = $null
+        try { Invoke-ApplicationPhase -ManifestPath $path -Runner { param($Context) $script:calls++ } }
+        catch { $err = $_.Exception.Message }
+        $err | Should -Match 'SuccessCodes'
+        $script:calls | Should -Be 0
+    }
+    It 'throws when SuccessCodes is empty or RetryCount is below one' {
+        $badCodes = New-AppEntry
+        $badCodes.SuccessCodes = @()
+        $path1 = New-AppManifest -Entries @($badCodes)
+        $err1 = $null
+        try { Invoke-ApplicationPhase -ManifestPath $path1 -Runner { param($Context) } }
+        catch { $err1 = $_.Exception.Message }
+        $err1 | Should -Match 'SuccessCodes'
+        $badRetry = New-AppEntry
+        $badRetry.RetryCount = 0
+        $path2 = New-AppManifest -Entries @($badRetry)
+        $err2 = $null
+        try { Invoke-ApplicationPhase -ManifestPath $path2 -Runner { param($Context) } }
+        catch { $err2 = $_.Exception.Message }
+        $err2 | Should -Match 'RetryCount'
+    }
+    It 'an empty manifest array is Ok with nothing to do' {
+        $script:calls = 0
+        $path = New-AppManifest -Entries @()
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner { param($Context) $script:calls++ }
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+        $script:calls | Should -Be 0
+    }
+}
+
+Describe 'Invoke-ApplicationPhase execution, retries, and the Q26 acknowledgement payload (Q25/Q26)' {
+    AfterEach {
+        foreach ($d in $script:appDirs) {
+            Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+        }
+        $script:appDirs = @()
+    }
+    It 'success path: Ok with zero failures, NeedsAcknowledgement false, exactly three result keys, one Runner call' {
+        $script:calls = 0
+        $script:seen = $null
+        $path = New-AppManifest -Entries @(New-AppEntry)
+        $runner = {
+            param($Context)
+            $script:calls++
+            $script:seen = $Context
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner $runner
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+        # The result is pure data for the consumer: exactly the three keys,
+        # so no prompt or acknowledgement affordance rides along (Q25).
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Failures,NeedsAcknowledgement,Ok'
+        $script:calls | Should -Be 1
+        # The runner received the entry object plus the computed paths.
+        $script:seen.Entry.Id | Should -Be 'app-1'
+        $script:seen.Entry.Name | Should -Be 'Sample Utility'
+        $script:seen.InstallerPath | Should -Be (Join-Path (Split-Path -Parent $path) 'SampleSetup.exe')
+        $script:seen.LogLocation | Should -Be (Join-Path (Split-Path -Parent $path) 'Logs\app-1.log')
+        $script:seen.TimeoutMinutes | Should -Be 10
+    }
+    It 'has zero prompt surface: no interactive prompt construct anywhere in module code (Q25)' {
+        # Comment-stripped code scan (same convention as the Q95 lock):
+        # documenting the prohibition in a comment must not trip it, but any
+        # CODE reference to an interactive prompt fails it.
+        $psm1Path = Join-Path (Split-Path -Parent $modulePath) 'OSDeploy.Orchestrator.psm1'
+        $codeLines = @((Get-Content -LiteralPath $psm1Path) | ForEach-Object { ($_ -split '#')[0] })
+        ($codeLines -join "`n") | Should -Not -Match '(?i)read-host|ui\.prompt|messagebox'
+    }
+    It 'runs the staged mock-partition app manifests (EZT and MMC, one entry each) to Ok' {
+        $script:ranIds = @()
+        $runner = {
+            param($Context)
+            $script:ranIds += [string]$Context.Entry.Id
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        foreach ($wf in @('EZT', 'MMC')) {
+            $r = Invoke-ApplicationPhase -ManifestPath (Join-Path $root ('Sources\Apps\' + $wf + '\manifest.json')) -Runner $runner
+            $r.Ok | Should -BeTrue
+            @($r.Failures).Count | Should -Be 0
+            $r.NeedsAcknowledgement | Should -BeFalse
+        }
+        (@($script:ranIds) -join ',') | Should -Be 'ezt-app-1,mmc-app-1'
+    }
+    It 'retries per the manifest: exit 1 twice then 0 satisfies RetryCount 3 on the third attempt' {
+        $script:calls = 0
+        $runner = {
+            param($Context)
+            $script:calls++
+            if ($script:calls -lt 3) { return [pscustomobject]@{ ExitCode = 1 } }
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        $path = New-AppManifest -Entries @(New-AppEntry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner $runner
+        $r.Ok | Should -BeTrue
+        $script:calls | Should -Be 3
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+    }
+    It 'honors the per-entry success code list: 3010 succeeds when listed and consumes no retry' {
+        $script:calls = 0
+        $entry = New-AppEntry
+        $entry.SuccessCodes = @(0, 3010)
+        $path = New-AppManifest -Entries @($entry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            $script:calls++
+            return [pscustomobject]@{ ExitCode = 3010 }
+        }
+        $r.Ok | Should -BeTrue
+        $script:calls | Should -Be 1
+    }
+    It 'treats a runner returning boolean true as success' {
+        $path = New-AppManifest -Entries @(New-AppEntry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner { param($Context) return $true }
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+    }
+    It 'treats a non-numeric runner report as a failed attempt, never an escaping exception' {
+        $entry = New-AppEntry
+        $entry.RetryCount = 2
+        $path = New-AppManifest -Entries @($entry)
+        $script:calls = 0
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            $script:calls++
+            return [pscustomobject]@{ ExitCode = 'garbage' }
+        }
+        $r.Ok | Should -BeFalse
+        $script:calls | Should -Be 2
+        @($r.Failures).Count | Should -Be 1
+        $r.Failures[0].Status | Should -Be 'Error'
+        $r.Failures[0].ExitCode | Should -BeNullOrEmpty
+    }
+    It 'permanent failure: the exhausted entry lands in Failures with the exact four-field Q26 payload' {
+        $script:calls = 0
+        $path = New-AppManifest -Entries @(New-AppEntry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            $script:calls++
+            return [pscustomobject]@{ ExitCode = 1 }
+        }
+        $r.Ok | Should -BeFalse
+        $script:calls | Should -Be 3
+        $r.NeedsAcknowledgement | Should -BeTrue
+        @($r.Failures).Count | Should -Be 1
+        $f = $r.Failures[0]
+        # EXACTLY the Q26 payload fields - program, status, exit code, log
+        # location - and nothing else.
+        (@($f.Keys | Sort-Object) -join ',') | Should -Be 'ExitCode,LogLocation,Program,Status'
+        $f.Program | Should -Be 'Sample Utility'
+        $f.Status | Should -Be 'Failed'
+        $f.ExitCode | Should -Be 1
+        $f.LogLocation | Should -Be (Join-Path (Split-Path -Parent $path) 'Logs\app-1.log')
+    }
+    It 'multiple exhausted entries accumulate into the payload in manifest order' {
+        $first = New-AppEntry
+        $first.Name = 'First Utility'
+        $second = New-AppEntry
+        $second.Id = 'app-2'
+        $second.Name = 'Second Utility'
+        $second.RetryCount = 2
+        $path = New-AppManifest -Entries @($first, $second)
+        $script:calls = 0
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            $script:calls++
+            if ($Context.Entry.Id -eq 'app-1') { return [pscustomobject]@{ ExitCode = 7 } }
+            return [pscustomobject]@{ ExitCode = 9 }
+        }
+        $r.Ok | Should -BeFalse
+        $r.NeedsAcknowledgement | Should -BeTrue
+        @($r.Failures).Count | Should -Be 2
+        # Both entries exhausted their own attempt budgets: 3 + 2 invocations.
+        $script:calls | Should -Be 5
+        $r.Failures[0].Program | Should -Be 'First Utility'
+        $r.Failures[0].Status | Should -Be 'Failed'
+        $r.Failures[0].ExitCode | Should -Be 7
+        $r.Failures[0].LogLocation | Should -Be (Join-Path (Split-Path -Parent $path) 'Logs\app-1.log')
+        $r.Failures[1].Program | Should -Be 'Second Utility'
+        $r.Failures[1].ExitCode | Should -Be 9
+        $r.Failures[1].LogLocation | Should -Be (Join-Path (Split-Path -Parent $path) 'Logs\app-2.log')
+    }
+    It 'a throwing runner exhausts its attempts and reports Status Error with a null exit code' {
+        $script:calls = 0
+        $entry = New-AppEntry
+        $entry.RetryCount = 2
+        $path = New-AppManifest -Entries @($entry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            $script:calls++
+            throw 'installer wrapper exploded'
+        }
+        $r.Ok | Should -BeFalse
+        $script:calls | Should -Be 2
+        @($r.Failures).Count | Should -Be 1
+        $r.Failures[0].Status | Should -Be 'Error'
+        $r.Failures[0].ExitCode | Should -BeNullOrEmpty
+        $r.Failures[0].Program | Should -Be 'Sample Utility'
+        $r.NeedsAcknowledgement | Should -BeTrue
+    }
+    It 'timeout: an attempt judged past a TimeoutMinutes 0 deadline fails even with a success-shaped exit code' {
+        $entry = New-AppEntry
+        $entry.RetryCount = 2
+        $entry.TimeoutMinutes = 0
+        $path = New-AppManifest -Entries @($entry)
+        $sleepyRunner = {
+            param($Context)
+            Start-Sleep -Milliseconds 50
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        # Deterministic both with the frozen -Now clock and with the live
+        # wall clock: a zero-minute deadline IS the attempt start, so the
+        # judgment read always meets it.
+        $withNow = Invoke-ApplicationPhase -ManifestPath $path -Runner $sleepyRunner -Now ([datetime]::UtcNow)
+        $withNow.Ok | Should -BeFalse
+        $withNow.NeedsAcknowledgement | Should -BeTrue
+        @($withNow.Failures).Count | Should -Be 1
+        $withNow.Failures[0].Status | Should -Be 'TimedOut'
+        $withNow.Failures[0].LogLocation | Should -Be (Join-Path (Split-Path -Parent $path) 'Logs\app-1.log')
+        $live = Invoke-ApplicationPhase -ManifestPath $path -Runner $sleepyRunner
+        $live.Ok | Should -BeFalse
+        @($live.Failures).Count | Should -Be 1
+        $live.Failures[0].Status | Should -Be 'TimedOut'
+    }
+    It 'a bounded timeout does not fire before the deadline (frozen -Now clock, TimeoutMinutes 5)' {
+        $entry = New-AppEntry
+        $entry.RetryCount = 1
+        $entry.TimeoutMinutes = 5
+        $path = New-AppManifest -Entries @($entry)
+        $r = Invoke-ApplicationPhase -ManifestPath $path -Runner {
+            param($Context)
+            Start-Sleep -Milliseconds 50
+            return [pscustomobject]@{ ExitCode = 0 }
+        } -Now ([datetime]::UtcNow)
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+    }
+    It 'the default runner silently invokes Start-Process with the entry arguments, resolving relative and rooted installers' {
+        Mock Start-Process -ModuleName OSDeploy.Orchestrator {
+            # Already-exited Process shape: the bounded wait is skipped and
+            # the ExitCode evaluation path runs.
+            return [pscustomobject]@{ Id = 4242; HasExited = $true; ExitCode = 0 }
+        }
+        $rooted = Join-Path $ckDir 'RootedSetup.exe'
+        $second = New-AppEntry
+        $second.Id = 'app-2'
+        $second.Installer = $rooted
+        $path = New-AppManifest -Entries @((New-AppEntry), $second)
+        $r = Invoke-ApplicationPhase -ManifestPath $path
+        $r.Ok | Should -BeTrue
+        @($r.Failures).Count | Should -Be 0
+        $r.NeedsAcknowledgement | Should -BeFalse
+        # A relative Installer resolves BESIDE the manifest; a rooted one is
+        # used exactly as written; the entry's own SilentArgs are passed.
+        Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 1 -ParameterFilter {
+            $FilePath -eq (Join-Path (Split-Path -Parent $path) 'SampleSetup.exe') -and $ArgumentList -eq '/S /norestart'
+        } -Scope It
+        Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 1 -ParameterFilter {
+            $FilePath -eq $rooted
+        } -Scope It
     }
 }

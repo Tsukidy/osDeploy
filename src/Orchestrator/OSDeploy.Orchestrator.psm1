@@ -1255,3 +1255,370 @@ function Invoke-DriverPhase {
     if (@($failed).Count -gt 0) { $result['RoutedToReview'] = $true }
     return $result
 }
+
+# ---------------------------------------------------------------------------
+# Application phase: manifest-driven execution with per-entry retries and
+# the Q26 Acknowledge-and-Continue payload (Q25/Q26)
+# ---------------------------------------------------------------------------
+
+# Q25/Q26 contract: applications are a workflow-FIXED set driven by the
+# per-workflow manifest the partition stages at
+# Sources\Apps\<Workflow>\manifest.json (the mock partition stages one entry
+# per workflow). Every entry carries the same nine fields; entries are
+# retried per the manifest's own RetryCount; exhausted entries accumulate
+# into the Q26 payload. There is NO per-application interactive prompt
+# anywhere in this phase (Q25): the success path is silent, and the
+# Acknowledge-and-Continue modal is the CONSUMER's job, driven by
+# NeedsAcknowledgement and the Failures payload (Q26) - the modal comes only
+# for failures.
+
+# Internal: the nine manifest fields every application entry must carry.
+$script:AppManifestFields = @('Id', 'Name', 'Installer', 'Type', 'SilentArgs',
+    'SuccessCodes', 'RetryCount', 'TimeoutMinutes', 'Required')
+
+# Internal: validate a parsed manifest document. Returns a string array of
+# errors (empty when valid); Invoke-ApplicationPhase throws on ANY error -
+# a malformed manifest is a staging bug, not a runtime warning (fail
+# closed). Beyond field presence this also rejects shapes the engine could
+# not execute honestly: non-string identity fields, an empty or non-numeric
+# SuccessCodes list, RetryCount below one, or a negative TimeoutMinutes.
+function Test-ApplicationManifest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        $Document
+    )
+    $errors = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Document) {
+        $errors.Add('Manifest document is null.')
+        return $errors.ToArray()
+    }
+    if (-not ($Document -is [System.Array])) {
+        $errors.Add('Manifest document is not a JSON array of application entries.')
+        return $errors.ToArray()
+    }
+    $index = 0
+    foreach ($entry in @($Document)) {
+        $label = ('entry {0}' -f $index)
+        $idValue = Get-OrchestratorField -Record $entry -Name 'Id'
+        if (-not [string]::IsNullOrWhiteSpace([string]$idValue)) {
+            $label = ('entry {0} (Id ''{1}'')' -f $index, $idValue)
+        }
+        if ($null -eq $entry) {
+            $errors.Add(('{0}: entry is null.' -f $label))
+            $index++
+            continue
+        }
+        foreach ($field in $script:AppManifestFields) {
+            $value = Get-OrchestratorField -Record $entry -Name $field
+            if ($null -eq $value) {
+                $errors.Add(('{0}: missing required field ''{1}''.' -f $label, $field))
+                continue
+            }
+            if ($field -in @('Id', 'Name', 'Installer', 'Type')) {
+                if ([string]::IsNullOrWhiteSpace([string]$value)) {
+                    $errors.Add(('{0}: field ''{1}'' must not be empty.' -f $label, $field))
+                }
+                continue
+            }
+            # SilentArgs may legitimately be an empty string (an installer
+            # taking no arguments); it must merely be present. Required is
+            # a presence-only boolean carried for consumers.
+            if ($field -eq 'SilentArgs' -or $field -eq 'Required') { continue }
+            if ($field -eq 'SuccessCodes') {
+                $codes = @($value)
+                if ($codes.Count -lt 1) {
+                    $errors.Add(('{0}: SuccessCodes must list at least one code.' -f $label))
+                    continue
+                }
+                foreach ($code in $codes) {
+                    try { $null = [long]$code }
+                    catch {
+                        $errors.Add(('{0}: SuccessCodes entries must be integers (''{1}'').' -f $label, $code))
+                    }
+                }
+                continue
+            }
+            # RetryCount and TimeoutMinutes must be whole numbers; a
+            # non-numeric value throws in the [int] cast and is reported
+            # here instead of surfacing mid-run.
+            $number = 0
+            $isNumber = $true
+            try { $number = [int]$value }
+            catch { $isNumber = $false }
+            if (-not $isNumber) {
+                $errors.Add(('{0}: field ''{1}'' must be a whole number.' -f $label, $field))
+                continue
+            }
+            if ($field -eq 'RetryCount' -and $number -lt 1) {
+                $errors.Add(('{0}: RetryCount must be at least 1, got {1}.' -f $label, $number))
+            }
+            if ($field -eq 'TimeoutMinutes' -and $number -lt 0) {
+                $errors.Add(('{0}: TimeoutMinutes must be 0 or more, got {1}.' -f $label, $number))
+            }
+        }
+        $index++
+    }
+    return $errors.ToArray()
+}
+
+# Internal: classify one Runner attempt against the entry contract.
+# $TimedOut is the combined verdict (the phase clock met the deadline OR
+# the runner self-reported TimedOut). Returns @{ Success; Status; ExitCode }
+# with the Status vocabulary used verbatim in the Q26 payload:
+# - 'Complete': ExitCode is in SuccessCodes, or the runner returned
+#   boolean $true (a runner that already evaluated the outcome).
+# - 'Failed': the attempt finished but its ExitCode is not in SuccessCodes
+#   (or the runner returned exactly $false).
+# - 'TimedOut': the attempt ran past TimeoutMinutes. ExitCode still reports
+#   whatever the runner produced (often $null for a killed process).
+# - 'Error': the runner threw or produced nothing - fail closed, no
+#   success is ever inferred from an absent report.
+function Get-AttemptOutcome {
+    [CmdletBinding()]
+    param(
+        $Output,
+        [string]$RunError,
+        [bool]$TimedOut,
+        $SuccessCodes
+    )
+    $exitValue = $null
+    if ($null -ne $Output -and -not ($Output -is [bool])) {
+        $exitProp = $Output.PSObject.Properties['ExitCode']
+        if ($null -ne $exitProp -and $null -ne $exitProp.Value) { $exitValue = $exitProp.Value }
+    }
+    if ($TimedOut) {
+        return @{ Success = $false; Status = 'TimedOut'; ExitCode = $exitValue }
+    }
+    if (-not [string]::IsNullOrEmpty($RunError)) {
+        return @{ Success = $false; Status = 'Error'; ExitCode = $null }
+    }
+    if ($null -eq $Output) {
+        return @{ Success = $false; Status = 'Error'; ExitCode = $null }
+    }
+    if ($Output -is [bool]) {
+        if ($Output) { return @{ Success = $true; Status = 'Complete'; ExitCode = $null } }
+        return @{ Success = $false; Status = 'Failed'; ExitCode = $null }
+    }
+    if ($null -eq $exitValue) {
+        return @{ Success = $false; Status = 'Error'; ExitCode = $null }
+    }
+    # A report whose ExitCode is not numeric at all (a malformed runner
+    # return) is a failed attempt, never an escaping cast exception.
+    $numericExit = $true
+    try { $null = [long]$exitValue }
+    catch { $numericExit = $false }
+    if (-not $numericExit) {
+        return @{ Success = $false; Status = 'Error'; ExitCode = $null }
+    }
+    foreach ($code in @($SuccessCodes)) {
+        if ([long]$code -eq [long]$exitValue) {
+            return @{ Success = $true; Status = 'Complete'; ExitCode = $exitValue }
+        }
+    }
+    return @{ Success = $false; Status = 'Failed'; ExitCode = $exitValue }
+}
+
+function Invoke-ApplicationPhase {
+    <#
+        .SYNOPSIS
+        Executes the per-workflow application manifest with per-entry
+        retries and the Q26 Acknowledge-and-Continue payload.
+
+        .DESCRIPTION
+        Q25/Q26: applications are a workflow-FIXED set driven by the
+        manifest at -ManifestPath (a JSON ARRAY of entries, each carrying
+        Id, Name, Installer, Type, SilentArgs, SuccessCodes, RetryCount,
+        TimeoutMinutes, Required). A missing file, unparseable JSON, a
+        non-array document, or any entry failing field validation THROWS:
+        a malformed manifest is a staging bug, never a runtime warning
+        (fail closed). An empty array is valid and completes Ok.
+
+        Per entry, the Runner is invoked up to RetryCount TOTAL attempts
+        (retry = re-invoke the Runner; exit 1 twice then 0 satisfies
+        RetryCount 3 on the third attempt). The Runner receives ONE
+        context object:
+        @{ Entry = <the manifest entry>; InstallerPath; SilentArgs;
+           LogLocation; TimeoutMinutes; NowUtc; DeadlineUtc }
+        - InstallerPath resolves a relative Installer BESIDE the manifest
+          (the staged Sources\Apps\<Workflow> layout); a rooted Installer
+          is used exactly as written.
+        - LogLocation is the per-entry log path <manifest dir>\Logs\<Id>.log
+          (a computed reporting path; the deployed host's installer
+          logging consumes it - nothing is created here).
+        - DeadlineUtc is the attempt's timeout deadline; a cooperating
+          runner can self-enforce it.
+        The Runner reports an outcome by returning an object with an
+        ExitCode property (the Start-Process -PassThru shape), or boolean
+        $true. Failure signals: throwing, returning exactly $false,
+        returning nothing, a non-numeric report, an object with TimedOut
+        = $true, or an ExitCode not in SuccessCodes.
+
+        Default Runner (used when -Runner is omitted): real silent
+        execution - Start-Process -FilePath <InstallerPath>
+        -ArgumentList <SilentArgs> -PassThru, then a BOUNDED wait. Full
+        timeout enforcement for a real installer is Windows behavior;
+        where practical it is implemented as the .NET bounded
+        Process.WaitForExit(milliseconds) call (Start-Process -Wait has no
+        timeout parameter): a timed-out process is force-killed and
+        reported as TimedOut with no ExitCode, and TimeoutMinutes 0 kills
+        without waiting at all.
+
+        Timeout clock model (deterministic by design): each attempt's
+        deadline is (phase clock + TimeoutMinutes), where the phase clock
+        is -Now when bound (normalized to UTC, FROZEN at that value) and
+        the live [DateTime]::UtcNow otherwise; the attempt is judged
+        timed-out when the clock at judgment meets the deadline. With
+        -Now bound and TimeoutMinutes 0, deadline == frozen clock, so
+        every attempt deterministically times out regardless of the -Now
+        value; with -Now bound and TimeoutMinutes above 0, phase-level
+        timeout is suspended (the runner's own bounded wait remains the
+        enforcer); without -Now the live clock gives real elapsed-time
+        enforcement.
+
+        Returns @{ Ok; Failures; NeedsAcknowledgement }: Ok = $true only
+        with zero failures; NeedsAcknowledgement = $true exactly when
+        failures exist (the Acknowledge-and-Continue modal payload - the
+        modal itself is the consumer's job and comes only for failures).
+        Each Failure carries EXACTLY the four Q26 fields: Program (= Name),
+        Status ('Failed' / 'TimedOut' / 'Error', the final attempt's
+        classification), ExitCode (the reported code, $null when none),
+        and LogLocation. Required is validated for presence but does not
+        differentiate behavior here: every exhausted entry fails the
+        phase; consumers may read it from the manifest when presenting the
+        modal. NO interactive prompt exists anywhere in this function.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [scriptblock]$Runner,
+        [datetime]$Now
+    )
+    # --- Load and validate the manifest (fail closed) ----------------------
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        throw ("Application manifest not found at '{0}'. The phase never invents entries; verify partition staging." -f $ManifestPath)
+    }
+    try {
+        $entries = Read-JsonFile -Path $ManifestPath
+    }
+    catch {
+        throw ("Application manifest at '{0}' could not be parsed: {1}" -f $ManifestPath, $_.Exception.Message)
+    }
+    if ($null -eq $entries -or -not ($entries -is [System.Array])) {
+        # Pipeline enumeration unwraps a top-level JSON array (the same
+        # reason Get-FlatInventory uses the comma trick): a 1-entry
+        # manifest arrives as the bare entry object and a 0-entry one as
+        # $null. Array-ness is therefore decided on the RAW document text:
+        # a leading '[' means the document IS an array and the parsed value
+        # is re-wrapped to match; anything else is a genuinely non-array
+        # document and fails closed in the validator below.
+        $raw = [System.IO.File]::ReadAllText($ManifestPath, [System.Text.Encoding]::ASCII).TrimStart()
+        if ($raw.Length -gt 0 -and $raw[0] -eq '[') {
+            $entries = @($entries)
+        }
+    }
+    $errors = Test-ApplicationManifest -Document $entries
+    if (@($errors).Count -gt 0) {
+        throw ("Application manifest at '{0}' failed its contract: {1}" -f $ManifestPath, ($errors -join '; '))
+    }
+
+    $runner = $Runner
+    if ($null -eq $runner) {
+        # Default (real) runner: see the .DESCRIPTION timeout note. The
+        # mocked-process shapes tests use (HasExited already true) skip the
+        # wait entirely; WaitForExit/Stop-Process are Windows behaviors on
+        # the deployed host.
+        $runner = {
+            param($Context)
+            $proc = Start-Process -FilePath $Context.InstallerPath -ArgumentList $Context.SilentArgs -PassThru
+            $timedOut = $false
+            if ([int]$Context.TimeoutMinutes -le 0) {
+                $timedOut = $true
+            }
+            elseif (-not $proc.HasExited) {
+                $seconds = [int][Math]::Round([double]$Context.TimeoutMinutes * 60)
+                if (-not $proc.WaitForExit($seconds * 1000)) { $timedOut = $true }
+            }
+            if ($timedOut) {
+                if (-not $proc.HasExited) {
+                    try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+                }
+                return [pscustomobject]@{ ExitCode = $null; TimedOut = $true }
+            }
+            return $proc
+        }
+    }
+
+    # --- Execute entries, retrying per the manifest ------------------------
+    $nowBound = $PSBoundParameters.ContainsKey('Now')
+    $nowClock = $null
+    if ($nowBound) { $nowClock = $Now.ToUniversalTime() }
+    $manifestDir = Split-Path -Parent $ManifestPath
+    $failures = @()
+    foreach ($entry in @($entries)) {
+        $id = [string](Get-OrchestratorField -Record $entry -Name 'Id')
+        $name = [string](Get-OrchestratorField -Record $entry -Name 'Name')
+        $installer = [string](Get-OrchestratorField -Record $entry -Name 'Installer')
+        $silentArgs = [string](Get-OrchestratorField -Record $entry -Name 'SilentArgs')
+        $codes = @(Get-OrchestratorField -Record $entry -Name 'SuccessCodes')
+        $retryCount = [int](Get-OrchestratorField -Record $entry -Name 'RetryCount')
+        $timeoutMinutes = [int](Get-OrchestratorField -Record $entry -Name 'TimeoutMinutes')
+        if ([System.IO.Path]::IsPathRooted($installer)) {
+            $installerPath = $installer
+        }
+        else {
+            $installerPath = Join-Path $manifestDir $installer
+        }
+        $logLocation = Join-Path $manifestDir ('Logs\' + $id + '.log')
+        $succeeded = $false
+        $lastStatus = 'Error'
+        $lastExit = $null
+        for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
+            $attemptStart = [DateTime]::UtcNow
+            if ($nowBound) { $attemptStart = $nowClock }
+            $deadline = $attemptStart.AddMinutes([double]$timeoutMinutes)
+            $context = @{
+                Entry          = $entry
+                InstallerPath  = $installerPath
+                SilentArgs     = $silentArgs
+                LogLocation    = $logLocation
+                TimeoutMinutes = $timeoutMinutes
+                NowUtc         = $attemptStart
+                DeadlineUtc    = $deadline
+            }
+            $runError = $null
+            $output = $null
+            try { $output = & $runner $context }
+            catch { $runError = $_.Exception.Message }
+            $judged = [DateTime]::UtcNow
+            if ($nowBound) { $judged = $nowClock }
+            $runnerTimedOut = $false
+            if ($null -ne $output -and -not ($output -is [bool])) {
+                $timedProp = $output.PSObject.Properties['TimedOut']
+                if ($null -ne $timedProp -and $timedProp.Value -eq $true) { $runnerTimedOut = $true }
+            }
+            $timedOut = ($judged -ge $deadline) -or $runnerTimedOut
+            $outcome = Get-AttemptOutcome -Output $output -RunError $runError -TimedOut $timedOut -SuccessCodes $codes
+            if ($outcome.Success) {
+                $succeeded = $true
+                break
+            }
+            $lastStatus = $outcome.Status
+            $lastExit = $outcome.ExitCode
+        }
+        if (-not $succeeded) {
+            $failures += @{
+                Program     = $name
+                Status      = $lastStatus
+                ExitCode    = $lastExit
+                LogLocation = $logLocation
+            }
+        }
+    }
+    return @{
+        Ok                  = (@($failures).Count -eq 0)
+        Failures            = @($failures)
+        NeedsAcknowledgement = (@($failures).Count -gt 0)
+    }
+}
