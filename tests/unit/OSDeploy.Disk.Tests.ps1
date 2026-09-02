@@ -274,3 +274,144 @@ Describe 'OSDeploy.Disk safety rules' {
         }
     }
 }
+
+Describe 'OSDeploy.Disk erase scopes and secondary-drive planning' {
+    Context 'Get-EraseScope (Q41/Q85 run-type scope variants)' {
+        It 'scopes InitialDeployment to the entire disk' {
+            $scope = @(Get-EraseScope -RunType 'InitialDeployment')
+            $scope.Count | Should -Be 1
+            $scope[0] | Should -Be 'EntireDisk'
+        }
+        It 'scopes PXEFullFactoryRebuild to the entire disk' {
+            $scope = @(Get-EraseScope -RunType 'PXEFullFactoryRebuild')
+            $scope.Count | Should -Be 1
+            $scope[0] | Should -Be 'EntireDisk'
+        }
+        It 'scopes FactoryRecovery to the Windows-related areas in order' {
+            $scope = @(Get-EraseScope -RunType 'FactoryRecovery')
+            ($scope -join ',') | Should -Be 'Efi,Msr,WindowsSpan'
+        }
+        It 'never lists the WinRE tools or OSDCloud partitions for recovery' {
+            $scope = @(Get-EraseScope -RunType 'FactoryRecovery')
+            $scope | Should -Not -Contain 'WinRE'
+            $scope | Should -Not -Contain 'Tools'
+            $scope | Should -Not -Contain 'Recovery'
+            $scope | Should -Not -Contain 'OSDCloud'
+        }
+        It 'matches run types case-insensitively (documented)' {
+            ((@(Get-EraseScope -RunType 'factoryrecovery')) -join ',') | Should -Be 'Efi,Msr,WindowsSpan'
+        }
+        It 'throws for an unknown run type (fail closed)' {
+            $err = { Get-EraseScope -RunType 'BareMetal' } | Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'BareMetal'
+        }
+        It 'throws for a near-miss run type (no guessing)' {
+            $err = { Get-EraseScope -RunType 'FactoryRecover' } | Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'FactoryRecover'
+        }
+    }
+
+    Context 'New-SecondaryPlan (Q58-Q60 planning)' {
+        BeforeAll {
+            $script:disk1 = @{ Number = 1; Model = 'WD Blue'; SerialNumber = 'S2'; Bus = 'SATA'; SizeBytes = 1000204886016; Internal = $true }
+            $script:disk2 = @{ Number = 2; Model = 'Seagate Barracuda'; SerialNumber = 'S3'; Bus = 'SATA'; SizeBytes = 2000398934016; Internal = $true }
+            $script:disk3 = @{ Number = 3; Model = 'Samsung 870'; SerialNumber = 'S4'; Bus = 'SATA'; SizeBytes = 500107862016; Internal = $true }
+        }
+        It 'plans GPT single full-size NTFS partitions per selected drive' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2))
+            $plans.Count | Should -Be 2
+            foreach ($p in $plans) {
+                ($p.PSObject.Properties.Name -join ',') | Should -Be 'Disk,Gpt,FileSystem,OnePartition,Letter,Label'
+                $p.Gpt | Should -BeTrue
+                $p.FileSystem | Should -Be 'NTFS'
+                $p.OnePartition | Should -BeTrue
+            }
+        }
+        It 'keeps the original disk record by reference in each plan' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1))
+            $plans[0].Disk | Should -Be $script:disk1
+        }
+        It 'assigns letters starting at D in selection order by default' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2, $script:disk3))
+            (($plans | ForEach-Object { [string]$_.Letter }) -join ',') | Should -Be 'D,E,F'
+        }
+        It 'skips taken letters D and E and continues from F' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2, $script:disk3) -ExistingLetters @('D', 'E'))
+            (($plans | ForEach-Object { [string]$_.Letter }) -join ',') | Should -Be 'F,G,H'
+        }
+        It 'labels Data, Data-2, Data-3 by default' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2, $script:disk3))
+            (($plans | ForEach-Object { $_.Label }) -join ',') | Should -Be 'Data,Data-2,Data-3'
+        }
+        It 'continues the label sequence past a preexisting Data (Q59 collision-safe)' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2, $script:disk3) -ExistingLabels @('Data'))
+            (($plans | ForEach-Object { $_.Label }) -join ',') | Should -Be 'Data-2,Data-3,Data-4'
+        }
+        It 'skips mid-sequence label collisions' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1, $script:disk2) -ExistingLabels @('Data-2'))
+            (($plans | ForEach-Object { $_.Label }) -join ',') | Should -Be 'Data,Data-3'
+        }
+        It 'treats label collisions case-insensitively (documented)' {
+            $plans = @(New-SecondaryPlan -Selected @($script:disk1) -ExistingLabels @('data'))
+            $plans[0].Label | Should -Be 'Data-2'
+        }
+        It 'returns an empty plan list for an empty selection' {
+            $plans = @(New-SecondaryPlan -Selected @())
+            $plans.Count | Should -Be 0
+        }
+        It 'fails closed when the D..Z letter range is exhausted' {
+            $many = @(1..24 | ForEach-Object { @{ Number = $_; SerialNumber = ('S{0}' -f $_); Internal = $true } })
+            $err = { New-SecondaryPlan -Selected $many } | Should -Throw -PassThru
+            $err.Exception.Message | Should -Match 'No free drive letter'
+        }
+    }
+
+    Context 'Get-SecondaryFailureOptions (Q63)' {
+        It 'returns exactly Retry and Skip, in that order' {
+            $opts = @(Get-SecondaryFailureOptions)
+            $opts.Count | Should -Be 2
+            $opts[0] | Should -Be 'Retry Secondary Drive'
+            $opts[1] | Should -Be 'Skip Failed Drive and Continue'
+        }
+    }
+
+    Context 'Test-SecondaryMountOnly (Q62 mount-verify only)' {
+        It 'warns for an unmounted volume without failing' {
+            $mounted = @{ Letter = 'D'; Label = 'Data'; Mounted = $true }
+            $unmounted = @{ Letter = 'E'; Label = 'Data-2'; Mounted = $false }
+            $r = @(Test-SecondaryMountOnly -Volumes @($mounted, $unmounted))
+            $r.Count | Should -Be 1
+            $r[0].Volume | Should -Be $unmounted
+            $r[0].Warning | Should -Not -BeNullOrEmpty
+        }
+        It 'returns warning entries with exactly Volume and Warning keys' {
+            $r = @(Test-SecondaryMountOnly -Volumes @(@{ Letter = 'F'; Label = 'Data-3'; Mounted = $false }))
+            (($r[0].Keys | Sort-Object) -join ',') | Should -Be 'Volume,Warning'
+        }
+        It 'names the letter and label in the warning text' {
+            $r = @(Test-SecondaryMountOnly -Volumes @(@{ Letter = 'E'; Label = 'Data-2'; Mounted = $false }))
+            $r[0].Warning | Should -Match 'E:'
+            $r[0].Warning | Should -Match 'Data-2'
+        }
+        It 'accepts DriveLetter as the letter field name (documented)' {
+            $r = @(Test-SecondaryMountOnly -Volumes @(@{ DriveLetter = 'G'; Label = 'Data-4'; Mounted = $false }))
+            $r.Count | Should -Be 1
+            $r[0].Warning | Should -Match 'G:'
+        }
+        It 'returns an empty list when every volume is mounted' {
+            $r = @(Test-SecondaryMountOnly -Volumes @(
+                @{ Letter = 'D'; Label = 'Data'; Mounted = $true }
+                @{ Letter = 'E'; Label = 'Data-2'; Mounted = $true }
+            ))
+            $r.Count | Should -Be 0
+        }
+        It 'returns an empty list for empty volume input' {
+            $r = @(Test-SecondaryMountOnly -Volumes @())
+            $r.Count | Should -Be 0
+        }
+        It 'warns when Mounted is missing (mount must be positively established)' {
+            $r = @(Test-SecondaryMountOnly -Volumes @(@{ Letter = 'D'; Label = 'Data' }))
+            $r.Count | Should -Be 1
+        }
+    }
+}

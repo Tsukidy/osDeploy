@@ -289,3 +289,216 @@ function Test-Capacity {
         NeedsAcknowledgement = $false
     }
 }
+
+# Case-insensitive membership test for the secondary label pool.
+# List[string].Contains is ordinal/case-sensitive, but NTFS volume-label
+# lookups are not, so the Q59 collision rule compares with PowerShell's
+# case-insensitive string -eq instead.
+function Test-LabelTaken {
+    [CmdletBinding()]
+    param(
+        [System.Collections.Generic.List[string]]$Labels,
+        [Parameter(Mandatory)][string]$Value
+    )
+    foreach ($label in $Labels) {
+        if ([string]$label -eq $Value) { return $true }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+# Public surface (erase scopes and secondary drives, Task 12)
+# ---------------------------------------------------------------------------
+
+# Q85 erase-scope variants per run type. InitialDeployment and PXE Full
+# Factory Rebuild erase the complete confirmed primary target, so their scope
+# is the single area 'EntireDisk'. FactoryRecovery erases only the
+# Windows-related target area and preserves the recovery environment: the
+# scope is exactly the ordered areas 'Efi', 'Msr', 'WindowsSpan' - the WinRE
+# tools partition and the OSDCloud Deployment Partition are NEVER listed for
+# any run type. "Deployment Erase" removes/recreates/formats only the area
+# the run type permits and is NOT certified secure data sanitization; callers
+# must word warnings accordingly.
+#
+# Fail closed: any RunType other than the three known values throws - no
+# default scope is ever guessed. Comparison uses PowerShell's
+# case-insensitive string -eq. The returned areas are area NAMES only; this
+# pure function performs no erasure.
+function Get-EraseScope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RunType
+    )
+
+    if ($RunType -eq 'InitialDeployment') { return @('EntireDisk') }
+    if ($RunType -eq 'PXEFullFactoryRebuild') { return @('EntireDisk') }
+    if ($RunType -eq 'FactoryRecovery') { return @('Efi', 'Msr', 'WindowsSpan') }
+
+    throw ('Unknown run type ''{0}''. Erase scope is defined only for InitialDeployment, PXEFullFactoryRebuild, and FactoryRecovery.' -f $RunType)
+}
+
+# Q58-Q60 secondary-drive preparation planning. Q58: only drives the
+# technician explicitly selected are ever planned - this function plans
+# exactly the records passed to it (Factory Recovery never modifies
+# secondary drives precisely because its caller never invokes this with
+# any). Q59: GPT, one full-size NTFS partition, automatic letters, and
+# collision-safe Data/Data-2/Data-3 labels. Q60: letters start at D.
+#
+# Per-drive plan objects carry exactly Disk (the original record, by
+# reference), Gpt = $true, FileSystem = 'NTFS', OnePartition = $true,
+# Letter, and Label. Letter is the bare drive-letter char (e.g. 'D'); the
+# caller renders it as 'D:'. Letters iterate D through Z, skipping
+# $ExistingLetters (uppercased, so 'd' and 'D' collide as they should) and
+# every letter already assigned within this call. Labels iterate the
+# unbounded Q59 sequence Data, Data-2, Data-3, ..., skipping
+# $ExistingLabels collisions (compared case-insensitively, since volume
+# labels are) and labels consumed earlier in this call.
+#
+# Fail closed: exhausting the D..Z letter range throws rather than reusing
+# a taken letter. A null record is skipped; an empty selection returns an
+# empty plan list. This function computes plans only - the caller executes
+# them.
+function New-SecondaryPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Selected,
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [string[]]$ExistingLabels = @(),
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [char[]]$ExistingLetters = @()
+    )
+
+    $takenLetters = New-Object System.Collections.Generic.List[char]
+    foreach ($letter in @($ExistingLetters)) {
+        if ($null -eq $letter) { continue }
+        $upper = [char]::ToUpperInvariant($letter)
+        if (-not $takenLetters.Contains($upper)) { $takenLetters.Add($upper) }
+    }
+
+    $takenLabels = New-Object System.Collections.Generic.List[string]
+    foreach ($label in @($ExistingLabels)) {
+        if ($null -eq $label) { continue }
+        if (-not (Test-LabelTaken -Labels $takenLabels -Value ([string]$label))) {
+            $takenLabels.Add([string]$label)
+        }
+    }
+
+    $plans = @()
+    $labelIndex = 0
+    foreach ($disk in @($Selected)) {
+        if ($null -eq $disk) { continue }
+
+        $letter = $null
+        for ($code = [int][char]'D'; $code -le [int][char]'Z'; $code++) {
+            $candidate = [char]$code
+            if (-not $takenLetters.Contains($candidate)) {
+                $letter = $candidate
+                break
+            }
+        }
+        if ($null -eq $letter) {
+            throw 'No free drive letter remains between D and Z for secondary-drive preparation. Reassign or remove existing volumes, or select fewer drives.'
+        }
+        $takenLetters.Add($letter)
+
+        $label = $null
+        while ($null -eq $label) {
+            $candidateLabel = 'Data'
+            if ($labelIndex -gt 0) {
+                $candidateLabel = 'Data-' + ($labelIndex + 1)
+            }
+            $labelIndex++
+            if (-not (Test-LabelTaken -Labels $takenLabels -Value $candidateLabel)) {
+                $label = $candidateLabel
+            }
+        }
+        $takenLabels.Add($label)
+
+        $plans += [pscustomobject]([ordered]@{
+            Disk         = $disk
+            Gpt          = $true
+            FileSystem   = 'NTFS'
+            OnePartition = $true
+            Letter       = $letter
+            Label        = $label
+        })
+    }
+
+    return $plans
+}
+
+# Q63 secondary-preparation failure options: exactly Retry Secondary Drive
+# or Skip Failed Drive and Continue, in that order. Primary deployment is
+# nonblocking either way (the caller's concern, not this function's). The
+# strings are fixed text - a fresh array is returned on every call so no
+# caller can mutate the canonical pair.
+function Get-SecondaryFailureOptions {
+    [CmdletBinding()]
+    param()
+
+    return @('Retry Secondary Drive', 'Skip Failed Drive and Continue')
+}
+
+# Q62 mount-verify-only check for recognized secondary volumes after
+# Windows assigns letters: warn when a volume did not mount; never fail,
+# never repair, never relabel, never compare inventory, never restore
+# letters. The return value is a verification WARNING LIST ONLY - there is
+# no failure, block, or repair output anywhere in the shape.
+#
+# Each entry carries exactly Volume (the original record, by reference, so
+# the caller can render it) and Warning. The warning names the volume by
+# drive letter (rendered 'E:'; the record may carry Letter or DriveLetter,
+# and a trailing ':' on the stored value is tolerated) and by label when
+# present. Mounted must be positively established: a volume warns unless
+# its Mounted field is $true, so missing/null metadata warns - the safe
+# direction for a warning-only check. Empty input or an all-mounted set
+# returns an empty list.
+function Test-SecondaryMountOnly {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Volumes
+    )
+
+    $warnings = @()
+    foreach ($volume in @($Volumes)) {
+        if ($null -eq $volume) { continue }
+        $mounted = Get-DiskField -Record $volume -Name 'Mounted'
+        if ($mounted -eq $true) { continue }
+
+        $letter = Get-DiskField -Record $volume -Name 'Letter'
+        if ($null -eq $letter) { $letter = Get-DiskField -Record $volume -Name 'DriveLetter' }
+        $letterText = ''
+        if ($null -ne $letter) {
+            $trimmed = ([string]$letter).TrimEnd(':')
+            if ($trimmed.Length -gt 0) { $letterText = $trimmed + ':' }
+        }
+
+        $label = Get-DiskField -Record $volume -Name 'Label'
+        $labelText = ''
+        if ($null -ne $label) { $labelText = [string]$label }
+
+        $display = 'unnamed secondary volume'
+        if (($letterText.Length -gt 0) -and ($labelText.Length -gt 0)) {
+            $display = '{0} ({1})' -f $letterText, $labelText
+        } elseif ($letterText.Length -gt 0) {
+            $display = $letterText
+        } elseif ($labelText.Length -gt 0) {
+            $display = $labelText
+        }
+
+        $warnings += @{
+            Volume  = $volume
+            Warning = ('Secondary volume {0} did not mount after drive letters were assigned. This is a warning only: the volume is not repaired, relabeled, or reassigned.' -f $display)
+        }
+    }
+
+    return $warnings
+}
