@@ -6,7 +6,7 @@
 
 **Later confirmed questions supersede conflicting parts of earlier questions. When two recorded answers conflict, the higher-numbered confirmed answer controls unless an even later answer explicitly changes it. Earlier answers remain in this file for decision history but must not be implemented where a later answer has replaced them.**
 
-Questions 1 through 100.
+Questions 1 through 102.
 
 ## Question 1
 
@@ -607,3 +607,15 @@ Questions 1 through 100.
 **Question:** What locale, region, and timezone defaults should deployment apply to installed Windows?
 
 **Answer:** Locale, region, and keyboard follow the validated Windows image, which is en-US, and the timezone comes from a central configuration value with a hard-coded default, following the established pattern that every configurable value has a hard-coded default and validated fallback. Not every workflow ends in OOBE: MMC completes at OOBE where the customer can still adjust region and keyboard, while EZT creates the full `User` account and finishes at the configured desktop with the staged locale values applied.
+
+## Question 101
+
+**Question:** Should the deployment layout include a dedicated Windows RE tools partition, or leave `winre.wim` on the Windows partition as pre-partitioned setup defaults to?
+
+**Answer:** Include a dedicated Windows RE tools partition. The staged GPT layout is EFI System Partition, MSR, the Windows free span, a dedicated Windows RE tools partition defaulting to 1024 MB through the configurable `WindowsReToolsPartitionSizeMB`, and the OSDCloud Deployment Partition at the end of the disk. The engine stages `winre.wim` into the tools partition and enables it with `reagentc` during specialize, so update uninstalls, Windows RE servicing, and repair paths remain robust regardless of Windows-partition fullness. The tools partition coexists with, and is not replaced by, the OSDCloud Deployment Partition's Factory Recovery entry: Windows RE handles Microsoft servicing rollback and repair, while Factory Recovery handles factory restore.
+
+## Question 102
+
+**Question:** What should the readiness-record file be named, renaming `DeploymentPartitionReady.json` from Question 92?
+
+**Answer:** Rename it to `ReadinessRecord.json`, matching the readiness-record phrasing the decision record already uses in prose. This supersedes only the filename in Question 92; the Deployment Partition Ready gate, its validation content, and the fail-closed revalidation behavior are unchanged.

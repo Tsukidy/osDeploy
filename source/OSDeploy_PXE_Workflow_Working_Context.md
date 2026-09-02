@@ -41,6 +41,24 @@ The scripts and complete implementation are not yet being written. The current w
 
 ## Core Architecture
 
+### Primary Disk Layout
+
+The staged GPT layout on the confirmed primary disk, created during Initial Deployment and PXE Full Factory Rebuild:
+
+| Partition | Size | Notes |
+| --- | --- | --- |
+| EFI System Partition | ~100 MB | Holds the boot files and the BCD store Windows Boot Manager uses. |
+| MSR | 16 MB | Standard Windows target reservation. |
+| Windows free span | remainder, front of disk | Windows setup carves the Windows partition from this contiguous span. |
+| Windows RE tools | `WindowsReToolsPartitionSizeMB` (1024 default) | Dedicated partition; the engine stages `winre.wim` and enables it with `reagentc`, keeping update uninstalls and Windows RE servicing robust regardless of Windows-partition fullness. |
+| OSDCloud Deployment Partition | `RecoveryPartitionSizeMB` (32768 default) | End of disk, NTFS so multi-index images over 4 GB are supported; boot is driven through Windows Boot Manager and BCD on the EFI System Partition rather than firmware-direct FAT32 boot. |
+
+Windows RE and Factory Recovery are separate mechanisms that coexist: Windows RE handles Microsoft servicing rollback and repair; the OSDCloud Deployment Partition handles factory restore.
+
+### PXE Serving
+
+WDS in standalone mode on the deployment server is the current mechanism for serving the customized boot image. The serving layer is a deliberately swappable boundary: the build produces a standard PXE-bootable WIM that any PXE server can serve. Researching alternatives such as iPXE with HTTP boot is an open implementation-time item, not a confirmed architecture change.
+
 ### Initial Deployment
 
 1. A technician PXE-boots the machine into a customized OSDeploy WinPE image.
@@ -89,7 +107,7 @@ The gate verifies:
 - Deployment-state and logging locations are writable.
 - Sufficient partition space remains for Microsoft image acquisition and the permanent Windows cache.
 
-After successful validation, PXE atomically writes `DeploymentPartitionReady.json` with the run, machine, disk, workflow, edition, configuration version, generated bundle hash, and timestamp. The record is generated from the staged content and is not a manually maintained release manifest.
+After successful validation, PXE atomically writes `ReadinessRecord.json` with the run, machine, disk, workflow, edition, configuration version, generated bundle hash, and timestamp. The record is generated from the staged content and is not a manually maintained release manifest. (The file was renamed from `DeploymentPartitionReady.json` by Question 102.)
 
 PXE then configures the one-time boot and restarts. If validation fails, it remains in PXE and offers Retry Staging or Cancel Deployment. When the partition boots, it revalidates the readiness record and primary-disk identity before continuing and does not reconnect to the deployment server.
 
@@ -245,6 +263,7 @@ Current defaults include:
 | Setting | Default |
 | --- | ---: |
 | `RecoveryPartitionSizeMB` | 32768 |
+| `WindowsReToolsPartitionSizeMB` | 1024 |
 | `LocalLogHistoryMaxMB` | 1024 |
 | `RecommendedPrimaryDriveSizeMB` | 122070 |
 
@@ -376,8 +395,8 @@ Active rule: remove Use Deployment Server Emergency Image from Technician Option
 
 ## Current Question State
 
-- Questions 1 through 100 are recorded in the active Markdown Q&A file.
-- Questions 88 through 100 are confirmed, not pending.
+- Questions 1 through 102 are recorded in the active Markdown Q&A file.
+- Questions 88 through 102 are confirmed, not pending.
 - Question 91 supersedes the DeploymentShare emergency-image portions of Questions 52 through 55.
 - OSDCloud Deployment Partition is the canonical term for the persistent partition that performs the primary deployment and later Factory Recovery.
 - Question 92 establishes the automatic Deployment Partition Ready gate before PXE may configure the one-time boot.
@@ -390,7 +409,9 @@ Active rule: remove Use Deployment Server Emergency Image from Technician Option
 - Question 98 confirms the order-database connection details, credentials, and field mapping live in central configuration and the existing order-database account is reused.
 - Question 99 confirms WPF with XAML as the GUI framework for the bootstrap controller and the partition-side screens, sharing one GUI module.
 - Question 100 confirms en-US image locale with a configurable timezone default, and that EZT finishes at the configured desktop while MMC finishes at OOBE.
-- Question 101 is the next unanswered question.
+- Question 101 confirms a dedicated Windows RE tools partition in the staged layout, configurable through `WindowsReToolsPartitionSizeMB` with a 1024 MB default, coexisting with Factory Recovery.
+- Question 102 renames the readiness record to `ReadinessRecord.json`, superseding only the filename portion of Question 92.
+- Question 103 is the next unanswered question.
 
 ## Working Files
 
