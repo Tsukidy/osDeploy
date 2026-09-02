@@ -403,3 +403,150 @@ Describe 'Invoke-Phase reboot handling and Resume-AfterReboot identity gate (Q35
         { Resume-AfterReboot -Expected @{ MachineId = 'm'; DiskId = 'd' } } | Should -Throw
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 19: integrity record, recheck, and local-only repair (Q90/Q92; Q91).
+# None of these tests needs an orchestration context or the single-instance
+# lock. The DEPLOYED directory under test is a fresh engine directory staged
+# from the mock partition's repair source (Sources\Orchestrator); the shared
+# fixture repair source itself is never modified - the dirty-source scenario
+# copies it aside first.
+# ---------------------------------------------------------------------------
+
+Describe 'Integrity record and recheck (Q90/Q92)' {
+    BeforeEach {
+        # Stage a fresh "deployed engine" directory from the partition repair
+        # source: the two dummy .psm1 files, nothing else.
+        $script:engineDir = Join-Path $ckDir ('engine-' + [guid]::NewGuid().ToString('N'))
+        $script:repairSrc = Join-Path $root 'Sources\Orchestrator'
+        New-Item -ItemType Directory -Path $script:engineDir | Out-Null
+        Get-ChildItem -LiteralPath $script:repairSrc -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $script:engineDir
+        }
+        # Record placement is caller-controlled by design (documented on
+        # New-IntegrityRecord), so the test owns it: a per-test path in the
+        # checkpoint scratch area.
+        $script:recordPath = Join-Path $ckDir ('integrity-' + [guid]::NewGuid().ToString('N') + '.json')
+        $script:record = New-IntegrityRecord -Directory $script:engineDir -RecordPath $script:recordPath
+    }
+    It 'generates the record from the staged tree (no manual manifest) and stores it atomically' {
+        # Key set is exactly the two contract fields.
+        (@($script:record.Keys | Sort-Object) -join ',') | Should -Be 'BundleHash,FileHashes'
+        @($script:record.FileHashes).Count | Should -Be 2
+        (@($script:record.FileHashes | ForEach-Object { $_.Path } | Sort-Object) -join ',') |
+            Should -Be 'Part1.psm1,Part2.psm1'
+        # Hashes are RECOMPUTED here for comparison - never hardcoded (the
+        # recorded bundle depends only on content, but comparing against a
+        # fresh computation proves the record describes this exact tree).
+        $fresh = Get-BundleHash -Inventory (New-FileInventory -Path $script:engineDir)
+        $script:record.BundleHash | Should -Be $fresh
+        # Atomic write: the file exists, is parseable, matches the returned
+        # record, and leaves no temp residue.
+        Test-Path -LiteralPath $script:recordPath | Should -BeTrue
+        $fromFile = Read-JsonFile -Path $script:recordPath
+        $fromFile.BundleHash | Should -Be $script:record.BundleHash
+        (@($fromFile.FileHashes | ForEach-Object { $_.Path } | Sort-Object) -join ',') |
+            Should -Be 'Part1.psm1,Part2.psm1'
+        @(Get-ChildItem -LiteralPath $ckDir -Filter ('*' + [System.IO.Path]::GetFileName($script:recordPath) + '.tmp*')).Count | Should -Be 0
+    }
+    It 'record-then-verify passes on the untouched directory, in memory and after a JSON round trip' {
+        $r = Test-Integrity -Directory $script:engineDir -Record $script:record
+        $r.Ok | Should -BeTrue
+        @($r.Mismatches).Count | Should -Be 0
+        # The after-restart path: the orchestrator reads IntegrityRecord.json
+        # back from the partition and verifies against the PSCustomObject.
+        $fromFile = Read-JsonFile -Path $script:recordPath
+        $r2 = Test-Integrity -Directory $script:engineDir -Record $fromFile
+        $r2.Ok | Should -BeTrue
+        @($r2.Mismatches).Count | Should -Be 0
+    }
+    It 'tampering one file fails the recheck with that file listed as Changed' {
+        [System.IO.File]::AppendAllText((Join-Path $script:engineDir 'Part1.psm1'), 'tamper')
+        $r = Test-Integrity -Directory $script:engineDir -Record $script:record
+        $r.Ok | Should -BeFalse
+        $changed = @($r.Mismatches | Where-Object { $_.Path -eq 'Part1.psm1' })
+        $changed.Count | Should -Be 1
+        $changed[0].Reason | Should -Be 'Changed'
+        # The derived bundle no longer matches either, so the bundle entry
+        # rides along with the per-file entry.
+        @($r.Mismatches | Where-Object { $_.Reason -eq 'BundleHash' }).Count | Should -Be 1
+    }
+    It 'reports Missing and Extra entries for a deleted and an added file' {
+        Remove-Item -LiteralPath (Join-Path $script:engineDir 'Part2.psm1') -Force
+        [System.IO.File]::WriteAllText((Join-Path $script:engineDir 'Extra.txt'), 'extra')
+        $r = Test-Integrity -Directory $script:engineDir -Record $script:record
+        $r.Ok | Should -BeFalse
+        @($r.Mismatches | Where-Object { $_.Path -eq 'Part2.psm1' -and $_.Reason -eq 'Missing' }).Count | Should -Be 1
+        @($r.Mismatches | Where-Object { $_.Path -eq 'Extra.txt' -and $_.Reason -eq 'Extra' }).Count | Should -Be 1
+    }
+    It 'fails closed on a tampered record bundle or a record missing its inventory' {
+        # Files untouched, but the record's BundleHash was altered: the file
+        # hashes match and the bundle does not - still not Ok.
+        $badBundle = @{ FileHashes = $script:record.FileHashes; BundleHash = ('0' * 64) }
+        $r = Test-Integrity -Directory $script:engineDir -Record $badBundle
+        $r.Ok | Should -BeFalse
+        @($r.Mismatches | Where-Object { $_.Reason -eq 'BundleHash' }).Count | Should -Be 1
+        # A record without its inventory can never verify (never defaulted).
+        $r2 = Test-Integrity -Directory $script:engineDir -Record @{ BundleHash = 'x' }
+        $r2.Ok | Should -BeFalse
+        @($r2.Mismatches | Where-Object { $_.Reason -eq 'InvalidRecord' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Repair-FromLocalSource local-only repair and the Q91 parameter boundary' {
+    BeforeEach {
+        $script:engineDir = Join-Path $ckDir ('engine-' + [guid]::NewGuid().ToString('N'))
+        $script:repairSrc = Join-Path $root 'Sources\Orchestrator'
+        New-Item -ItemType Directory -Path $script:engineDir | Out-Null
+        Get-ChildItem -LiteralPath $script:repairSrc -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $script:engineDir
+        }
+        $script:recordPath = Join-Path $ckDir ('integrity-' + [guid]::NewGuid().ToString('N') + '.json')
+        $script:record = New-IntegrityRecord -Directory $script:engineDir -RecordPath $script:recordPath
+    }
+    It 'repairs from the clean partition repair source: recopy, exact content restored, Ok under the SAME record' {
+        [System.IO.File]::AppendAllText((Join-Path $script:engineDir 'Part2.psm1'), 'tamper')
+        [System.IO.File]::WriteAllText((Join-Path $script:engineDir 'Leftover.txt'), 'junk')
+        $r = Repair-FromLocalSource -Directory $script:engineDir -RepairSource $script:repairSrc -Record $script:record
+        $r.Repaired | Should -BeTrue
+        # Success shape is exactly @{ Repaired = $true } - no Outcome key.
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Repaired'
+        # The copy went OVER the directory: the extra file is gone, the
+        # tampered file is restored, and the recheck passes with the same
+        # record (no re-recording after repair).
+        Test-Path -LiteralPath (Join-Path $script:engineDir 'Leftover.txt') | Should -BeFalse
+        $check = Test-Integrity -Directory $script:engineDir -Record $script:record
+        $check.Ok | Should -BeTrue
+        @($check.Mismatches).Count | Should -Be 0
+    }
+    It 'tampering after a successful repair yields the blocking Technician Review outcome' {
+        # First damage is repaired from the clean source.
+        [System.IO.File]::AppendAllText((Join-Path $script:engineDir 'Part1.psm1'), 'tamper')
+        $first = Repair-FromLocalSource -Directory $script:engineDir -RepairSource $script:repairSrc -Record $script:record
+        $first.Repaired | Should -BeTrue
+        # Damage returns AND the repair source copy is dirty the same way, so
+        # the recopy cannot restore the recorded hashes: second failure stops
+        # for a person (Q92). The dirty source is a COPY - the shared mock
+        # fixture is never modified.
+        [System.IO.File]::AppendAllText((Join-Path $script:engineDir 'Part1.psm1'), 'tamper-again')
+        $badSrc = Join-Path $ckDir ('badsrc-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $badSrc | Out-Null
+        Get-ChildItem -LiteralPath $script:repairSrc -File | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $badSrc
+        }
+        [System.IO.File]::AppendAllText((Join-Path $badSrc 'Part1.psm1'), 'tamper-again')
+        $second = Repair-FromLocalSource -Directory $script:engineDir -RepairSource $badSrc -Record $script:record
+        $second.Repaired | Should -BeFalse
+        $second.Outcome | Should -Be 'TechnicianReview'
+        # The directory now holds the bad content and still fails the recheck.
+        (Test-Integrity -Directory $script:engineDir -Record $script:record).Ok | Should -BeFalse
+    }
+    It 'the parameter list IS the connectivity boundary: no Share/UNC/Server/SMB parameters (Q91)' {
+        foreach ($name in @('Repair-FromLocalSource', 'New-IntegrityRecord', 'Test-Integrity')) {
+            $cmd = Get-Command -Name $name -ErrorAction SilentlyContinue
+            $cmd | Should -Not -BeNullOrEmpty
+            $offending = @($cmd.Parameters.Keys | Where-Object { $_ -match '(?i)share|unc|server|smb' })
+            ('{0} parameters: [{1}]' -f $name, ($offending -join ', ')) | Should -Be ('{0} parameters: []' -f $name)
+        }
+    }
+}

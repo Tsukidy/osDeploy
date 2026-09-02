@@ -7,6 +7,9 @@ Set-StrictMode -Version Latest
 # when the caller already loaded them.
 Import-Module (Join-Path $PSScriptRoot '..\Shared\OSDeploy.State\OSDeploy.State.psd1')
 Import-Module (Join-Path $PSScriptRoot '..\Shared\OSDeploy.Logging\OSDeploy.Logging.psd1')
+# OSDeploy.Util supplies the integrity primitives (New-FileInventory,
+# Get-BundleHash) used by the Q90/Q92 record/recheck/repair functions.
+Import-Module (Join-Path $PSScriptRoot '..\Shared\OSDeploy.Util\OSDeploy.Util.psd1')
 
 # ---------------------------------------------------------------------------
 # Process-wide single-instance state (Q35/Q36: the orchestrator is
@@ -484,4 +487,214 @@ function Resume-AfterReboot {
     $state.RebootPending = $false
     $null = New-Checkpoint -State $state -Path $context.CheckpointPath
     return @{ Outcome = 'Ready'; State = $state }
+}
+
+# ---------------------------------------------------------------------------
+# Integrity: hash record, recheck, local-only repair (Q90/Q92; Q91 boundary)
+# ---------------------------------------------------------------------------
+
+# Q91 IS the parameter list. None of these functions accepts a share, UNC,
+# server, or SMB path in any form: repair recopies ONLY from a local partition
+# directory the caller names, so nothing in these signatures can even express
+# a DeploymentShare or deployment-server destination. The boundary is enforced
+# structurally and locked by a parameter-name regex test.
+
+function New-IntegrityRecord {
+    <#
+        .SYNOPSIS
+        Generates and atomically stores the SHA-256 integrity record for a
+        staged directory.
+
+        .DESCRIPTION
+        Q90/Q92: hashes are GENERATED at staging time from the staged tree -
+        there is no manual manifest to trust. Builds the file inventory
+        (New-FileInventory: relative path, size, SHA-256 per file) and the
+        bundle hash over that inventory (Get-BundleHash), then persists the
+        record with Write-AtomicJson so a reader never observes a partial
+        document.
+
+        DESIGN CHOICE: the destination is an explicit -RecordPath parameter
+        rather than a derived '<parent of Directory>\State\IntegrityRecord.json'.
+        The caller owns the partition layout (the bootstrap and the
+        orchestrator write into <PartitionRoot>\State\IntegrityRecord.json),
+        and an explicit parameter keeps this function from guessing paths the
+        same way the state engine never invents content. The parent directory
+        of RecordPath must already exist (a staged partition's State does); a
+        missing one is a staging error that throws through Write-AtomicJson
+        instead of being silently created.
+
+        Returns the record object that was written:
+        @{ FileHashes = <inventory>; BundleHash = <bundle hash> }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$RecordPath
+    )
+    $inventory = Get-FlatInventory -Path $Directory
+    if (@($inventory).Count -eq 0) {
+        # An empty tree has nothing to attest: refuse rather than invent a
+        # record whose bundle would describe no files (staging error).
+        throw ("New-IntegrityRecord refuses an empty directory at '{0}'; the staged tree must contain the files to hash." -f $Directory)
+    }
+    $record = @{
+        FileHashes = $inventory
+        BundleHash = Get-BundleHash -Inventory $inventory
+    }
+    Write-AtomicJson -Path $RecordPath -Value $record
+    return $record
+}
+
+# Internal: index one side of the integrity comparison by relative path.
+# Entries may be PSCustomObjects (New-FileInventory output, or IntegrityRecord
+# read back through Read-JsonFile) or hashtables; Get-OrchestratorField
+# tolerates both. Returns a hashtable of Path -> Sha256.
+function Get-InventoryIndex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        $Entries
+    )
+    $index = @{}
+    foreach ($entry in @($Entries)) {
+        $path = [string](Get-OrchestratorField -Record $entry -Name 'Path')
+        $index[$path] = [string](Get-OrchestratorField -Record $entry -Name 'Sha256')
+    }
+    return $index
+}
+
+# Internal: New-FileInventory as an always-flat object[] (-NoEnumerate makes a
+# naive @() wrap double-nest its output, and an empty directory produces no
+# pipeline output at all; both normalize here).
+function Get-FlatInventory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $inventory = New-FileInventory -Path $Path
+    if ($null -eq $inventory) { return @() }
+    return @($inventory)
+}
+
+function Test-Integrity {
+    <#
+        .SYNOPSIS
+        Rechecks a directory against a stored integrity record.
+
+        .DESCRIPTION
+        Q90/Q92: the recheck recomputes the full inventory and bundle hash
+        and compares them against the record - nothing is trusted from the
+        previous pass. Ok is $true ONLY when every per-file hash matches AND
+        the derived bundle hash matches.
+
+        Mismatches is an array of @{ Path; Reason } entries:
+        - Reason 'Changed': the file exists but its SHA-256 differs.
+        - Reason 'Missing': the record lists the file and the directory no
+          longer has it (a deleted directory reports every recorded file as
+          Missing - fail closed, never an exception).
+        - Reason 'Extra': the directory holds a file the record never listed.
+        - Reason 'BundleHash' (Path = $null): the files may match but the
+          derived bundle does not - only possible when the RECORD itself is
+          inconsistent with its own inventory.
+        - Reason 'InvalidRecord' (Path = $null): the record lacks its
+          FileHashes or BundleHash field and can never verify.
+
+        Record may be the in-memory hashtable New-IntegrityRecord returned or
+        the PSCustomObject read back from IntegrityRecord.json after a
+        restart.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)]$Record
+    )
+    $mismatches = @()
+    $recordHashes = Get-OrchestratorField -Record $Record -Name 'FileHashes'
+    $recordBundle = Get-OrchestratorField -Record $Record -Name 'BundleHash'
+    if ($null -eq $recordHashes -or $null -eq $recordBundle) {
+        # Fail closed: an incomplete record is never defaulted into shape.
+        $mismatches += @{ Path = $null; Reason = 'InvalidRecord' }
+        return @{ Ok = $false; Mismatches = @($mismatches) }
+    }
+    $inventory = @()
+    if (Test-Path -LiteralPath $Directory) {
+        $inventory = Get-FlatInventory -Path $Directory
+    }
+    $current = Get-InventoryIndex -Entries $inventory
+    $recorded = Get-InventoryIndex -Entries $recordHashes
+    foreach ($path in @($recorded.Keys | Sort-Object)) {
+        if (-not $current.Contains($path)) {
+            $mismatches += @{ Path = $path; Reason = 'Missing' }
+            continue
+        }
+        if ($current[$path] -cne $recorded[$path]) {
+            $mismatches += @{ Path = $path; Reason = 'Changed' }
+        }
+    }
+    foreach ($path in @($current.Keys | Sort-Object)) {
+        if (-not $recorded.Contains($path)) {
+            $mismatches += @{ Path = $path; Reason = 'Extra' }
+        }
+    }
+    # Bundle gate: a non-empty current tree recomputes and compares; an empty
+    # current tree cannot match a non-empty record (already reported Missing),
+    # and two empty trees are trivially consistent.
+    if (@($inventory).Count -gt 0) {
+        if ((Get-BundleHash -Inventory $inventory) -cne [string]$recordBundle) {
+            $mismatches += @{ Path = $null; Reason = 'BundleHash' }
+        }
+    }
+    elseif (@($recordHashes).Count -gt 0) {
+        $mismatches += @{ Path = $null; Reason = 'BundleHash' }
+    }
+    return @{ Ok = ($mismatches.Count -eq 0); Mismatches = @($mismatches) }
+}
+
+function Repair-FromLocalSource {
+    <#
+        .SYNOPSIS
+        Recopies a damaged directory from the LOCAL partition repair source
+        and revalidates it against the SAME integrity record.
+
+        .DESCRIPTION
+        Q92 failure handling: on a failed recheck the only permitted remedy
+        is a recopy from the partition's own repair source (Q91: never a
+        server path - the parameter list cannot express one). The repair
+        removes the directory's content and copies the RepairSource content
+        over it, so foreign files vanish and missing files return. It then
+        re-runs Test-Integrity with the SAME record: repair never re-records,
+        because the record is the staging-time truth the directory must be
+        restored TO.
+
+        Outcomes:
+        - @{ Repaired = $true } when the recheck passes.
+        - @{ Repaired = $false; Outcome = 'TechnicianReview' } when the
+          recopy still fails validation (the repair source itself is damaged
+          or missing) - the second failure stops at a blocking Technician
+          Review; there is no Ignore/Continue-Anyway path.
+
+        A missing RepairSource returns the failure outcome without touching
+        the directory: it cannot restore anything, so second-failure
+        semantics apply unchanged.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$RepairSource,
+        [Parameter(Mandatory)]$Record
+    )
+    if (-not (Test-Path -LiteralPath $RepairSource)) {
+        return @{ Repaired = $false; Outcome = 'TechnicianReview' }
+    }
+    # Recopy OVER the directory: recreate the target if it was deleted, drop
+    # everything it currently holds, then copy every repair-source child in.
+    New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force
+    Get-ChildItem -LiteralPath $RepairSource -Force |
+        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $Directory -Recurse -Force }
+    $check = Test-Integrity -Directory $Directory -Record $Record
+    if ($check.Ok) {
+        return @{ Repaired = $true }
+    }
+    return @{ Repaired = $false; Outcome = 'TechnicianReview' }
 }
