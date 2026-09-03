@@ -267,11 +267,12 @@ param(
 Import-Module $ModulePath -Force
 $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
 [System.IO.File]::WriteAllText($OutcomePath, 'Ran=' + ([string]$entry.Ran))
-# Release through the module copy BEFORE exiting: this probe must die
-# holding nothing. An unreleased exit would abandon
-# Global\OSDeploy.Orchestrator and force the suite's own in-process entry
-# (Check 5) down the abandoned-mutex recovery path instead of the normal
-# acquisition path this check means to exercise.
+# Release through the module copy BEFORE exiting: deterministic teardown.
+# This probe must die holding nothing, and an unreleased exit must never be
+# relied on - whether the kernel marks the mutex abandoned or destroys the
+# object at owner death depends on whether any other handle survives (the
+# 4.6/4.7 keeper-handle mechanics), so proper release is what makes the
+# outcome deterministic.
 $m = Get-OrchestratorMutex
 if ($null -ne $m) {
     try { $null = $m.ReleaseMutex() } catch { }
