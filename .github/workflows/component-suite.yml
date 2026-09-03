@@ -1,0 +1,62 @@
+name: Component Suite
+
+# Linux job: static gates + full unit tree (the dev-box ladder, in CI).
+# Windows job: the orchestrator component suite under Windows PowerShell 5.1
+# on a real NTFS system - the outstanding task 11.1 verification. GitHub
+# Windows runners execute elevated, which the ACL / Scheduled Task checks
+# require. The suite writes tests/component/last-run.log itself (it never
+# exists on Linux); the log is uploaded as an artifact either way.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  linux-gates:
+    name: Static gates and unit tree (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Pester 5
+        shell: pwsh
+        run: |
+          $pester = Get-Module -ListAvailable Pester |
+              Where-Object { $_.Version.Major -ge 5 } |
+              Select-Object -First 1
+          if ($null -eq $pester) {
+            Install-Module Pester -MinimumVersion 5 -Force -Scope CurrentUser
+          }
+
+      - name: Static gates
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/gates/Invoke-StaticGates.ps1
+
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          $r = Invoke-Pester -Path tests/unit -Output Detailed -PassThru
+          Write-Output ("RESULT=" + $r.Result + " PASSED=" + $r.PassedCount + " FAILED=" + $r.FailedCount + " SKIPPED=" + $r.SkippedCount)
+          exit ([int]($r.FailedCount -gt 0))
+
+  windows-component-suite:
+    name: Windows component suite (PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suite's documented invocation: a dedicated elevated 5.1 process.
+      - name: Run component suite
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/component/ComponentSuite.ps1
+
+      - name: Upload suite log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: component-last-run
+          path: tests/component/last-run.log
+          if-no-files-found: ignore
