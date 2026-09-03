@@ -67,7 +67,12 @@ function Enter-Orchestrator {
         Acquires the machine-wide mutex 'Global\OSDeploy.Orchestrator'. When a
         second launch detects the lock held (by this process or any other), it
         only writes the SecondInstanceExit event to the partition log and
-        returns @{ Ran = $false } without touching any state file. The first
+        returns @{ Ran = $false } without touching any state file. An
+        ABANDONED mutex (its previous owner died holding it - the Q35
+        power-loss shape) is treated as ACQUIRED: on Windows the
+        AbandonedMutexException from WaitOne accompanies a successful
+        ownership transfer, and the on-disk checkpoint loaded below remains
+        the only state authority. The first
         launch holds the mutex for the process lifetime and returns the state
         loaded from <PartitionRoot>\State\DeploymentState.json. A missing or
         contract-invalid file is a caller/staging error and throws; state is
@@ -91,7 +96,24 @@ function Enter-Orchestrator {
     # the kernel mutex. The mutex NAME is the cross-process contract - never
     # generated or randomized.
     $mutex = New-Object System.Threading.Mutex($false, 'Global\OSDeploy.Orchestrator')
-    if (-not $mutex.WaitOne(0)) {
+    # Abandoned-mutex recovery (Q35 crash re-entry): when the previous owner
+    # (process or thread) died holding this mutex, a Windows WaitOne(0) on it
+    # throws AbandonedMutexException AND transfers ownership to THIS caller -
+    # the exception accompanies a successful acquisition, it does not deny
+    # one. That is the deployed power-loss re-entry path: a crashed
+    # orchestrator's abandoned mutex must never block the next boot task, and
+    # the on-disk checkpoint loaded below remains the only state authority.
+    # (Non-Windows PowerShell mutex emulation never surfaces this exception,
+    # so this branch is unreachable there; the Windows component suite
+    # proves it with a deliberate owner-death scenario.)
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    if (-not $acquired) {
         $mutex.Dispose()
         Write-SecondInstanceExit -PartitionRoot $PartitionRoot
         return @{ Ran = $false }

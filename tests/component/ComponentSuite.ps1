@@ -32,13 +32,16 @@
 #      twice.
 #   4. The orchestrator launch under the task acquires the single-instance
 #      mutex (Enter-Orchestrator reports Ran = True from inside the task),
-#      and the task settles (its process exit releases the mutex) before
-#      the in-process checks continue.
-#   5. Invoke-DeploymentSequence FULL RUN against a fresh mock OSDeploy
-#      Deployment Partition on the real filesystem: contract-valid end
-#      state, scoped cleanup (marker, boot override, runtime directory
-#      removed; recovery content retained), log verification, and the
-#      scheduled task itself surviving cleanup.
+#      the task settles (its process exit releases the mutex) before the
+#      in-process checks continue, and the Q35 abandoned-mutex recovery is
+#      proven: a grandchild dies owning Global\OSDeploy.Orchestrator while
+#      a probe holds the kernel object open, and the probe's
+#      Enter-Orchestrator still acquires.
+#   5. Invoke-DeploymentSequence FULL RUN against a fresh mock
+#      OSDCloud Deployment Partition staged on the real filesystem:
+#      contract-valid end state, scoped cleanup (marker, boot override,
+#      runtime directory removed; recovery content retained), log
+#      verification, and the scheduled task itself surviving cleanup.
 #   6. Integrity record -> tamper detection -> local-only repair (Q90/Q92):
 #      stage a record over a copy of the orchestrator source, flip a byte
 #      and delete a file, Test-Integrity fails closed, Repair-FromLocalSource
@@ -264,6 +267,16 @@ param(
 Import-Module $ModulePath -Force
 $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
 [System.IO.File]::WriteAllText($OutcomePath, 'Ran=' + ([string]$entry.Ran))
+# Release through the module copy BEFORE exiting: this probe must die
+# holding nothing. An unreleased exit would abandon
+# Global\OSDeploy.Orchestrator and force the suite's own in-process entry
+# (Check 5) down the abandoned-mutex recovery path instead of the normal
+# acquisition path this check means to exercise.
+$m = Get-OrchestratorMutex
+if ($null -ne $m) {
+    try { $null = $m.ReleaseMutex() } catch { }
+    try { $m.Dispose() } catch { }
+}
 '@
             [System.IO.File]::WriteAllText($probePath, $probeScript, [System.Text.Encoding]::ASCII)
             $probeArgument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" "{3}"' -f $probePath, $script:modulePath, $partition, $outcomePath
@@ -299,6 +312,97 @@ $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
             Assert-True $probeSettled '4.4 the probe task left the Running state (its process exit released the single-instance mutex before the in-process checks)'
             $probeUnregister = Unregister-OrchestratorTask -TaskName $script:probeTaskName
             Assert-True ([bool]$probeUnregister.Ok) '4.5 the probe task is retired'
+
+            # 4.6/4.7: the Q35 abandoned-mutex recovery. True abandonment
+            # needs a THIRD-PARTY handle alive while the owner dies (with no
+            # other handle the kernel destroys the object and nothing is
+            # abandoned), so the mechanics are: the probe process opens the
+            # named mutex WITHOUT owning it (the keeper handle), spawns a
+            # grandchild that acquires through Enter-Orchestrator and exits
+            # immediately without releasing (the owner dies), and then calls
+            # Enter-Orchestrator itself - which must acquire despite the
+            # abandonment. Everything runs in suite-unique workspace paths.
+            Write-Output 'NOTE 4.6 this check proves the Q35 abandoned-mutex recovery: a grandchild acquires Global\OSDeploy.Orchestrator and dies without releasing while a probe holds the kernel object open (true abandonment); the probe Enter-Orchestrator must still acquire.'
+            $abandonGrandchildPath = Join-Path $script:workspace 'Enter-Orchestrator-Abandon.ps1'
+            $abandonProbePath = Join-Path $script:workspace 'Abandonment-Probe.ps1'
+            $abandonGrandchildOutcome = Join-Path $script:workspace 'abandon-grandchild-outcome.txt'
+            $abandonProbeOutcome = Join-Path $script:workspace 'abandon-probe-outcome.txt'
+            $abandonGrandchildScript = @'
+param(
+    [string]$ModulePath,
+    [string]$PartitionRoot,
+    [string]$OutcomePath
+)
+Import-Module $ModulePath -Force
+$entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
+[System.IO.File]::WriteAllText($OutcomePath, 'Ran=' + ([string]$entry.Ran), [System.Text.Encoding]::ASCII)
+# Deliberately exit WITHOUT releasing: this process dies owning
+# Global\OSDeploy.Orchestrator, abandoning it (the Q35 power-loss shape).
+exit 0
+'@
+            $abandonProbeScript = @'
+param(
+    [string]$ModulePath,
+    [string]$PartitionRoot,
+    [string]$GrandchildPath,
+    [string]$GrandchildOutcomePath,
+    [string]$OutcomePath
+)
+Import-Module $ModulePath -Force
+try {
+    # Keeper handle: opens the named mutex WITHOUT owning it, so the kernel
+    # object survives the grandchild's death and is marked abandoned.
+    $keeper = New-Object System.Threading.Mutex($false, 'Global\OSDeploy.Orchestrator')
+    $null = Start-Process -FilePath 'powershell.exe' -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" "{3}"' -f $GrandchildPath, $ModulePath, $PartitionRoot, $GrandchildOutcomePath) -Wait -PassThru
+    if (-not (Test-Path -LiteralPath $GrandchildOutcomePath)) {
+        [System.IO.File]::WriteAllText($OutcomePath, 'ProbeRan=False:GrandchildNoOutcome', [System.Text.Encoding]::ASCII)
+        exit 1
+    }
+    $grandchildText = ([System.IO.File]::ReadAllText($GrandchildOutcomePath)).Trim()
+    if ($grandchildText -ne 'Ran=True') {
+        [System.IO.File]::WriteAllText($OutcomePath, ('ProbeRan=False:Grandchild=' + $grandchildText), [System.Text.Encoding]::ASCII)
+        exit 1
+    }
+    # Abandonment is now in force: the owner died holding the mutex while
+    # this probe keeps the object open. Enter-Orchestrator must acquire.
+    $result = 'ProbeRan=False'
+    try {
+        $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
+        $result = 'ProbeRan=' + ([string]$entry.Ran)
+    }
+    catch {
+        $result = 'ProbeRan=Threw:' + $_.Exception.GetType().Name
+    }
+    # Release cleanly whatever happened, then drop the keeper handle.
+    $m = Get-OrchestratorMutex
+    if ($null -ne $m) {
+        try { $null = $m.ReleaseMutex() } catch { }
+        try { $m.Dispose() } catch { }
+    }
+    try { $keeper.Dispose() } catch { }
+    [System.IO.File]::WriteAllText($OutcomePath, $result, [System.Text.Encoding]::ASCII)
+    if ($result -eq 'ProbeRan=True') { exit 0 }
+    exit 1
+}
+catch {
+    [System.IO.File]::WriteAllText($OutcomePath, ('ProbeRan=Error:' + $_.Exception.Message), [System.Text.Encoding]::ASCII)
+    exit 1
+}
+'@
+            [System.IO.File]::WriteAllText($abandonGrandchildPath, $abandonGrandchildScript, [System.Text.Encoding]::ASCII)
+            [System.IO.File]::WriteAllText($abandonProbePath, $abandonProbeScript, [System.Text.Encoding]::ASCII)
+            $abandonArgument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f $abandonProbePath, $script:modulePath, $partition, $abandonGrandchildPath, $abandonGrandchildOutcome, $abandonProbeOutcome
+            $abandonProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $abandonArgument -Wait -PassThru
+            $abandonGrandchildText = ''
+            if (Test-Path -LiteralPath $abandonGrandchildOutcome) {
+                $abandonGrandchildText = ([System.IO.File]::ReadAllText($abandonGrandchildOutcome)).Trim()
+            }
+            Assert-True ($abandonGrandchildText -eq 'Ran=True') ('4.6 the grandchild acquired Global\OSDeploy.Orchestrator through Enter-Orchestrator and died holding it (outcome: {0})' -f $abandonGrandchildText)
+            $abandonProbeText = ''
+            if (Test-Path -LiteralPath $abandonProbeOutcome) {
+                $abandonProbeText = ([System.IO.File]::ReadAllText($abandonProbeOutcome)).Trim()
+            }
+            Assert-True ($abandonProc.ExitCode -eq 0 -and $abandonProbeText -eq 'ProbeRan=True') ('4.7 Enter-Orchestrator recovered from the abandoned mutex and acquired it (probe exit {0}, outcome: {1})' -f $abandonProc.ExitCode, $abandonProbeText)
         }
         catch {
             Assert-True $false ('4.ABORT the mutex-under-task check group aborted with an unexpected error: ' + $_.Exception.Message)
@@ -491,8 +595,10 @@ $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
             $tamperBytes2 = [System.IO.File]::ReadAllBytes($part1Path)
             if ($tamperBytes2[0] -eq 35) { $tamperBytes2[0] = 36 } else { $tamperBytes2[0] = 35 }
             [System.IO.File]::WriteAllBytes($part1Path, $tamperBytes2)
+            $tamperedHashBefore = (Get-FileHash -LiteralPath $part1Path -Algorithm SHA256).Hash
             $failedRepair = Repair-FromLocalSource -Directory $integrityTarget -RepairSource (Join-Path $script:workspace 'NoSuchRepairSource') -Record $recordFromFile
-            Assert-True ((-not [bool]$failedRepair.Repaired) -and [string](Get-SuiteJsonField -Record $failedRepair -Name 'Outcome') -eq 'TechnicianReview') '6.8 a missing repair source stops at the blocking Technician Review (no Ignore/Continue path) and leaves the directory untouched'
+            $tamperedHashAfter = (Get-FileHash -LiteralPath $part1Path -Algorithm SHA256).Hash
+            Assert-True ((-not [bool]$failedRepair.Repaired) -and [string](Get-SuiteJsonField -Record $failedRepair -Name 'Outcome') -eq 'TechnicianReview' -and $tamperedHashAfter -eq $tamperedHashBefore) '6.8 a missing repair source stops at the blocking Technician Review (no Ignore/Continue path) and leaves the directory untouched (tampered file hash unchanged)'
             Assert-True (-not [bool](Test-Integrity -Directory $integrityTarget -Record $recordFromFile).Ok) '6.9 the still-tampered directory continues to fail the recheck after the refused repair'
         }
         catch {
