@@ -1983,3 +1983,275 @@ function Invoke-ActivationFlow {
         Incomplete       = $true
     }
 }
+
+# ---------------------------------------------------------------------------
+# MMC workflow specifics and the Energy Star phase (Q14/Q15/Q30/Q32,
+# Q20-Q23)
+# ---------------------------------------------------------------------------
+
+function Get-MmcPlan {
+    <#
+        .SYNOPSIS
+        Returns the MMC workflow plan: the Audit-Mode finalize/sysprep
+        sequence with NO EZT account work (Q14/Q15/Q30/Q32).
+
+        .DESCRIPTION
+        MMC's final endpoint is Windows OOBE (Q14) reached from Audit Mode
+        (Q30). Steps is the finalize sequence Invoke-MmcFinalize executes:
+        cleanup of the temporary deployment artifacts FIRST, then Sysprep
+        /generalize /oobe whose failure routing stays in Audit Mode (Q32).
+
+        AccountSteps is EMPTY BY CONSTRUCTION: unlike the EZT account plan
+        (CreateUser / AddGroupMember / EnsureUserDisabled /
+        CreateShortcut), MMC creates no User account, seeds no autologon,
+        and adds no password shortcut (Q14/Q15) - MMC delivers mostly
+        default customer-facing setup at OOBE. The plan is pure data; the
+        consumer executes the finalize sequence through Invoke-MmcFinalize.
+
+        Returns @{ Workflow; FinalEndpoint; Steps; AccountSteps } where
+        each Step carries Order, Action, and (for the sysprep step)
+        Arguments and OnFailure.
+    #>
+    [CmdletBinding()]
+    param()
+    return @{
+        Workflow      = 'MMC'
+        FinalEndpoint = 'OOBE'
+        Steps         = @(
+            @{ Order = 1; Action = 'CleanupTemporaryArtifacts' }
+            @{
+                Order     = 2
+                Action    = 'Sysprep'
+                Arguments = '/generalize /oobe'
+                OnFailure = 'StayInAuditMode'
+            }
+        )
+        AccountSteps  = @()
+    }
+}
+
+function Invoke-MmcFinalize {
+    <#
+        .SYNOPSIS
+        MMC finalize IN Audit Mode: cleanup of temporary artifacts first,
+        then Sysprep /generalize /oobe (Q30/Q32).
+
+        .DESCRIPTION
+        Exact order (assertable through an injected call log): the Cleanup
+        scriptblock runs FIRST - removing the temporary deployment
+        artifacts Audit-Mode staging leaves behind - and only then is the
+        Sysprep scriptblock invoked. Completion is recorded ONLY when the
+        Sysprep call succeeds (Q32): @{ Outcome = 'Complete' }.
+
+        Sysprep failure contract: the Sysprep scriptblock FAILS by
+        throwing, by returning exactly boolean $false (the module-wide
+        convention), or by returning an object with a non-zero ExitCode
+        (the Start-Process -PassThru shape; every non-zero code counts -
+        an absent or non-numeric ExitCode is a failure too, never an
+        escaping cast exception). Every failure shape returns
+        @{ Outcome = 'SysprepFailure'; StayInAuditMode = $true } - the
+        BLOCKING technician error that keeps the machine in Audit Mode -
+        and NEVER re-runs cleanup: cleanup already ran BEFORE the OOBE
+        entry attempt, and no cleanup runs after it (Q32: run no cleanup
+        after entering OOBE). The caller routes SysprepFailure to the
+        blocking Technician Review; there is no Ignore/Continue path.
+
+        Cleanup failure contract: the Cleanup scriptblock fails by
+        throwing or by returning boolean $false, and the failure THROWS out
+        of this function BEFORE the Sysprep call is made - with temporary
+        artifacts still present the machine must not enter OOBE, so it
+        stays in Audit Mode by construction.
+
+        Defaults (both injectable):
+        - Cleanup: a recorder that returns the temporary-artifact removal
+          steps as data without side effects (the deploy-host-only
+          pattern; the real artifact set is host-specific and arrives
+          with the host wiring, which injects the performing scriptblock).
+        - Sysprep: the REAL call - sysprep.exe /generalize /oobe - a
+          deploy-host-only path that maps a non-zero exit code to boolean
+          $false so the failure contract above stays uniform; the
+          successful call is what initiates the reboot into OOBE (Q32).
+          Tests always inject.
+
+        Returns @{ Outcome = 'Complete' } exactly when the Sysprep call
+        succeeded.
+    #>
+    [CmdletBinding()]
+    param(
+        [scriptblock]$Sysprep,
+        [scriptblock]$Cleanup
+    )
+    $cleanupRunner = $Cleanup
+    if ($null -eq $cleanupRunner) {
+        $cleanupRunner = {
+            return @(
+                @{ Step = 'RemoveTemporaryArtifacts'; Target = 'Audit-Mode staging artifacts (temporary deployment files)' }
+            )
+        }
+    }
+    $sysprepRunner = $Sysprep
+    if ($null -eq $sysprepRunner) {
+        $sysprepRunner = {
+            # String interpolation, not Join-Path: the deploy-host path is
+            # drive-qualified and Join-Path rejects an absent drive when the
+            # suite stages $env:SystemRoot on a non-Windows platform.
+            $sysprepExe = "$env:SystemRoot\System32\Sysprep\sysprep.exe"
+            $proc = Start-Process -FilePath $sysprepExe -ArgumentList '/generalize', '/oobe' -Wait -PassThru
+            if ($null -ne $proc) {
+                $exitProp = $proc.PSObject.Properties['ExitCode']
+                if ($null -ne $exitProp -and $null -ne $exitProp.Value -and [int]$exitProp.Value -ne 0) {
+                    return $false
+                }
+            }
+            return $true
+        }
+    }
+    # Cleanup FIRST (Q30). Its output is only inspected for the failure
+    # signal; the recorded steps never leak into this function's output.
+    $cleanupOutput = & $cleanupRunner
+    if ($cleanupOutput -is [bool] -and $cleanupOutput -eq $false) {
+        throw 'MMC finalize cleanup failed (boolean $false). Nothing entered OOBE; the machine stays in Audit Mode.'
+    }
+    # THEN Sysprep (Q30/Q32). Every failure shape below keeps the machine
+    # in Audit Mode and never re-runs cleanup.
+    $output = $null
+    $failed = $false
+    try { $output = & $sysprepRunner }
+    catch { $failed = $true }
+    if (-not $failed -and $output -is [bool] -and $output -eq $false) {
+        $failed = $true
+    }
+    if (-not $failed -and $null -ne $output -and -not ($output -is [bool])) {
+        $exitProp = $output.PSObject.Properties['ExitCode']
+        if ($null -ne $exitProp) {
+            $exitValue = $exitProp.Value
+            $numericExit = $true
+            try { $null = [long]$exitValue }
+            catch { $numericExit = $false }
+            # Fail closed: an absent, non-numeric, or non-zero exit code in a
+            # PassThru-shaped report is a sysprep failure, never a success.
+            if (-not $numericExit -or $null -eq $exitValue -or [long]$exitValue -ne 0) {
+                $failed = $true
+            }
+        }
+    }
+    if ($failed) {
+        return @{ Outcome = 'SysprepFailure'; StayInAuditMode = $true }
+    }
+    return @{ Outcome = 'Complete' }
+}
+
+# Q23: the regulated-state list is configurable and evaluated only at
+# deployment time. 'CA' is the confirmed member today (Q22); later
+# server-side list changes affect new deployments only, and deployed
+# systems never phone home for state policy.
+$script:RegulatedStates = @('CA')
+
+# Q20's decision vocabulary: the technician's overridable choice for a
+# matched state. 'Apply' is the default for matched states; 'Decline' is
+# the saved form of Q20's Do-Not-Apply choice (the warning Q20 requires
+# before honoring a Decline belongs to the consumer acting on it).
+$script:PowerDecisionValues = @('Apply', 'Decline')
+
+function Resolve-PowerPolicy {
+    <#
+        .SYNOPSIS
+        Q20-Q23 power-policy decision table: regulated-state evaluation,
+        the per-workflow popup flag, and the saved-decision short-circuit.
+
+        .DESCRIPTION
+        Detection (returned when -SavedDecision is NOT bound - the
+        deployment-time first evaluation, Q23):
+        - Regulated state + MMC -> @{ Action = 'Apply'; Popup = $false;
+          Policy = <regulated descriptor> }: Energy Star settings with NO
+          popup (Q22).
+        - Regulated state + EZT -> @{ Action = 'Apply'; Popup = $true;
+          Policy = <regulated descriptor> }: Energy Star settings PLUS the
+          persistent choice popup (Q22).
+        - Unregulated state -> @{ Action = 'Apply'; Popup = $false;
+          Policy = <unregulated descriptor> }: High Performance with a
+          60-minute display timeout and system sleep disabled (Q22).
+        'Apply' is the default for matched states (Q20); unregulated rows
+        apply their policy outright - there is no choice surface. Policy
+        descriptors are FRESH objects per call: regulated = the Energy
+        Star configuration; unregulated = PowerPlan 'High Performance',
+        DisplayTimeoutMinutes 60, SystemSleep 'Disabled'.
+
+        RegulatedState is compared case-insensitively against the
+        configurable regulated-state list (Q23). -Workflow matches 'MMC'
+        or 'EZT' case-insensitively and defaults to 'MMC' (the no-popup
+        profile - the conservative default for a customer-facing popup);
+        an unknown workflow token THROWS, because popup semantics are
+        never guessed.
+
+        Saved decision (Q20/Q21):
+        - VALID ('Apply' or 'Decline', case-insensitive, surrounding
+          whitespace tolerated; the canonical token is returned)
+          short-circuits detection: @{ Action = <canonical saved token>;
+          Popup = <per table>; FromSaved = $true }. FromSaved = $true is
+          the Q21 no-re-ask marker: the consumer replays the decision
+          without presenting the popup. The Policy descriptor is
+          deliberately absent from this shape; it depends only on
+          RegulatedState/-Workflow, so the consumer re-derives it from the
+          detection table (a call without -SavedDecision).
+        - MISSING (bound but empty/whitespace - a caller that looked for a
+          saved decision and found none) or INVALID (any other value)
+          re-asks: the detection row for context PLUS the Q21 signal:
+          @{ Action = 'Apply'; Popup = <per table>; Policy = <descriptor>;
+          NeedsPrompt = $true }. Bound-but-empty and not-bound are
+          deliberately different: the first is Factory Recovery finding no
+          saved decision, the second is the deployment-time evaluation.
+
+        The Q20 warning required before honoring a Decline, and the Q20/
+        Q23 persistence of the effective choice into FactoryProfile.json,
+        belong to the consumer; this function is the pure decision table.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RegulatedState,
+        [string]$Workflow = 'MMC',
+        [string]$SavedDecision
+    )
+    $workflowToken = ''
+    if ($null -ne $Workflow) { $workflowToken = $Workflow.Trim() }
+    if ($workflowToken -ine 'MMC' -and $workflowToken -ine 'EZT') {
+        throw ("Unknown workflow '{0}': popup semantics are customer-facing and are never guessed; expected 'MMC' or 'EZT'." -f $workflowToken)
+    }
+    $isRegulated = @($script:RegulatedStates) -contains $RegulatedState.Trim()
+    # The persistent choice popup exists only on the regulated EZT row (Q22).
+    $popup = ($isRegulated -and ($workflowToken -ieq 'EZT'))
+    # Fresh descriptor objects per call: no caller can mutate another
+    # caller's descriptor.
+    $policy = $null
+    if ($isRegulated) {
+        $policy = @{
+            Regulated = $true
+            Name      = 'EnergyStar'
+            PowerPlan = 'Energy Star'
+        }
+    }
+    else {
+        $policy = @{
+            Regulated             = $false
+            Name                  = 'HighPerformance'
+            PowerPlan             = 'High Performance'
+            DisplayTimeoutMinutes = 60
+            SystemSleep           = 'Disabled'
+        }
+    }
+    if ($PSBoundParameters.ContainsKey('SavedDecision')) {
+        $saved = ''
+        if ($null -ne $SavedDecision) { $saved = $SavedDecision.Trim() }
+        $matched = $null
+        foreach ($value in @($script:PowerDecisionValues)) {
+            if ($saved -ieq $value) { $matched = $value }
+        }
+        if ($null -ne $matched) {
+            return @{ Action = $matched; Popup = $popup; FromSaved = $true }
+        }
+        # Missing (empty) or invalid: the Q21 ask-again signal, with the
+        # detection row carried for context.
+        return @{ Action = 'Apply'; Popup = $popup; Policy = $policy; NeedsPrompt = $true }
+    }
+    return @{ Action = 'Apply'; Popup = $popup; Policy = $policy }
+}

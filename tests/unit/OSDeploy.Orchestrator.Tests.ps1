@@ -1702,3 +1702,215 @@ Describe 'Invoke-ActivationFlow incomplete-activation choices (Q19, Q18)' {
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 24: MMC workflow specifics and the Energy Star phase (Q14/Q15/Q30/
+# Q32, Q20-Q23). None of these tests needs the single-instance lock or an
+# orchestration context. No real sysprep ever runs: finalize tests inject
+# recording scriptblocks, and the default-sysprep tests MOCK Start-Process
+# in module scope (the deploy-host-only default; $env:SystemRoot is staged
+# so the path resolves on Linux too).
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-MmcFinalize Audit-Mode finalize order and failure routing (Q30/Q32)' {
+    BeforeEach {
+        $script:log = @()
+    }
+    It 'success is Complete after cleanup, proven by one shared call log: every cleanup call precedes the sysprep call' {
+        $r = Invoke-MmcFinalize -Cleanup { $script:log += 'cleanup' } -Sysprep { $script:log += 'sysprep'; return $true }
+        # Completion is recorded ONLY on sysprep success: exactly one key.
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Outcome'
+        $r.Outcome | Should -Be 'Complete'
+        ($script:log -join ',') | Should -Be 'cleanup,sysprep'
+    }
+    It 'a throwing sysprep returns SysprepFailure that stays in Audit Mode and is NOT Complete' {
+        $r = Invoke-MmcFinalize -Cleanup { $script:log += 'cleanup' } -Sysprep { $script:log += 'sysprep'; throw 'sysprep fatal error' }
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Outcome,StayInAuditMode'
+        $r.Outcome | Should -Be 'SysprepFailure'
+        $r.StayInAuditMode | Should -BeTrue
+    }
+    It 'a $false-returning sysprep is a failure that NEVER re-runs cleanup: exactly one cleanup call, before sysprep' {
+        $r = Invoke-MmcFinalize -Cleanup { $script:log += 'cleanup' } -Sysprep { $script:log += 'sysprep'; return $false }
+        $r.Outcome | Should -Be 'SysprepFailure'
+        $r.StayInAuditMode | Should -BeTrue
+        # Q32: run no cleanup after entering (or attempting) OOBE - the one
+        # cleanup call happened BEFORE the sysprep attempt and is not retried.
+        @($script:log | Where-Object { $_ -eq 'cleanup' }).Count | Should -Be 1
+        ($script:log -join ',') | Should -Be 'cleanup,sysprep'
+    }
+    It 'a non-zero sysprep exit code (Start-Process -PassThru shape) is a failure; every non-zero code counts' {
+        foreach ($code in @(1, 5, 3010)) {
+            $script:log = @()
+            $r = Invoke-MmcFinalize -Cleanup { $script:log += 'cleanup' } -Sysprep {
+                $script:log += 'sysprep'
+                return [pscustomobject]@{ ExitCode = $code }
+            }
+            $r.Outcome | Should -Be 'SysprepFailure'
+            $r.StayInAuditMode | Should -BeTrue
+            ($script:log -join ',') | Should -Be 'cleanup,sysprep'
+        }
+    }
+    It 'a failing cleanup (throw or $false) fails BEFORE the sysprep call: nothing enters OOBE (Q32)' {
+        # Temporary artifacts must be gone before OOBE entry, so a failed
+        # cleanup can never be followed by sysprep; the machine stays in
+        # Audit Mode by construction.
+        $script:sysprepCalls = 0
+        { Invoke-MmcFinalize -Cleanup { return $false } -Sysprep { $script:sysprepCalls++; return $true } } | Should -Throw
+        $script:sysprepCalls | Should -Be 0
+        { Invoke-MmcFinalize -Cleanup { throw 'cleanup could not remove the artifacts' } -Sysprep { $script:sysprepCalls++; return $true } } | Should -Throw
+        $script:sysprepCalls | Should -Be 0
+    }
+    It 'the default sysprep invokes sysprep.exe /generalize /oobe exactly once and a zero exit code is Complete' {
+        $oldSystemRoot = $env:SystemRoot
+        $env:SystemRoot = 'C:\Windows'
+        try {
+            Mock Start-Process -ModuleName OSDeploy.Orchestrator { return [pscustomobject]@{ ExitCode = 0 } }
+            # Both scriptblocks defaulted: the recorder cleanup runs without
+            # side effects, then the real (deploy-host-only) sysprep call.
+            $r = Invoke-MmcFinalize
+            $r.Outcome | Should -Be 'Complete'
+            Should -Invoke Start-Process -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter {
+                $FilePath -match '(?i)sysprep\.exe$' -and (@($ArgumentList) -join ' ') -eq '/generalize /oobe'
+            }
+        }
+        finally {
+            if ($null -eq $oldSystemRoot) { Remove-Item Env:\SystemRoot -ErrorAction SilentlyContinue }
+            else { $env:SystemRoot = $oldSystemRoot }
+        }
+    }
+    It 'the default sysprep maps a non-zero exit code to SysprepFailure with StayInAuditMode (deploy-host failure path)' {
+        $oldSystemRoot = $env:SystemRoot
+        $env:SystemRoot = 'C:\Windows'
+        try {
+            Mock Start-Process -ModuleName OSDeploy.Orchestrator { return [pscustomobject]@{ ExitCode = 5 } }
+            $r = Invoke-MmcFinalize
+            $r.Outcome | Should -Be 'SysprepFailure'
+            $r.StayInAuditMode | Should -BeTrue
+        }
+        finally {
+            if ($null -eq $oldSystemRoot) { Remove-Item Env:\SystemRoot -ErrorAction SilentlyContinue }
+            else { $env:SystemRoot = $oldSystemRoot }
+        }
+    }
+}
+
+Describe 'Get-MmcPlan MMC finalize plan and the no-EZT-account guard (Q14/Q15/Q30/Q32)' {
+    It 'describes the Audit-Mode finalize sequence: cleanup temporary artifacts first, then sysprep /generalize /oobe with StayInAuditMode routing' {
+        $plan = Get-MmcPlan
+        (@($plan.Keys | Sort-Object) -join ',') | Should -Be 'AccountSteps,FinalEndpoint,Steps,Workflow'
+        $plan.Workflow | Should -Be 'MMC'
+        $plan.FinalEndpoint | Should -Be 'OOBE'
+        (@($plan.Steps | ForEach-Object { $_.Order }) -join ',') | Should -Be '1,2'
+        (@($plan.Steps | ForEach-Object { $_.Action }) -join ',') | Should -Be 'CleanupTemporaryArtifacts,Sysprep'
+        $sysprepStep = @($plan.Steps | Where-Object { $_.Action -eq 'Sysprep' })[0]
+        $sysprepStep.Arguments | Should -Be '/generalize /oobe'
+        $sysprepStep.OnFailure | Should -Be 'StayInAuditMode'
+    }
+    It 'creates NO User account, autologon, or password shortcut: AccountSteps is empty and no such token exists anywhere in the plan (Q14/Q15)' {
+        $plan = Get-MmcPlan
+        @($plan.AccountSteps).Count | Should -Be 0
+        $actions = @(@($plan.Steps) + @($plan.AccountSteps) | ForEach-Object { [string]$_.Action })
+        foreach ($banned in @('CreateUser', 'AddGroupMember', 'EnsureUserDisabled', 'CreateShortcut')) {
+            $actions -contains $banned | Should -BeFalse
+        }
+        # The serialized plan text carries no account, autologon, or password
+        # token at all (structured scan + raw-text scan, the Q24 convention).
+        ($plan | ConvertTo-Json -Depth 6) | Should -Not -Match '(?i)createuser|addgroupmember|ensureuserdisabled|createshortcut|autologon|password'
+    }
+    It 'contrast: the EZT account plan carries the four account steps MMC omits' {
+        $ezt = Invoke-EztAccountPhase
+        (@($ezt.Steps | ForEach-Object { $_.Action }) -join ',') | Should -Be 'CreateUser,AddGroupMember,EnsureUserDisabled,CreateShortcut'
+        $mmcActions = @((Get-MmcPlan).Steps | ForEach-Object { $_.Action })
+        foreach ($eztAction in @('CreateUser', 'AddGroupMember', 'EnsureUserDisabled', 'CreateShortcut')) {
+            $mmcActions -contains $eztAction | Should -BeFalse
+        }
+    }
+}
+
+Describe 'Resolve-PowerPolicy decision table and saved-decision handling (Q20-Q23)' {
+    It 'CA + MMC applies the regulated Energy Star policy with NO popup' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'MMC'
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Action,Policy,Popup'
+        $r.Action | Should -Be 'Apply'
+        $r.Popup | Should -BeFalse
+        $r.Policy.Regulated | Should -BeTrue
+        $r.Policy.Name | Should -Be 'EnergyStar'
+        $r.Policy.PowerPlan | Should -Be 'Energy Star'
+    }
+    It 'CA + EZT applies the regulated Energy Star policy WITH the persistent choice popup' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'EZT'
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Action,Policy,Popup'
+        $r.Action | Should -Be 'Apply'
+        $r.Popup | Should -BeTrue
+        $r.Policy.Regulated | Should -BeTrue
+        $r.Policy.Name | Should -Be 'EnergyStar'
+    }
+    It 'an unregulated state applies High Performance with a 60-minute display timeout and system sleep disabled, regardless of workflow (Q22)' {
+        foreach ($state in @('TX', 'NV', 'WA')) {
+            $r = Resolve-PowerPolicy -RegulatedState $state -Workflow 'EZT'
+            (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Action,Policy,Popup'
+            $r.Action | Should -Be 'Apply'
+            $r.Popup | Should -BeFalse
+            $r.Policy.Regulated | Should -BeFalse
+            $r.Policy.Name | Should -Be 'HighPerformance'
+            $r.Policy.PowerPlan | Should -Be 'High Performance'
+            $r.Policy.DisplayTimeoutMinutes | Should -Be 60
+            $r.Policy.SystemSleep | Should -Be 'Disabled'
+        }
+    }
+    It 'state and workflow tokens match case-insensitively' {
+        $r = Resolve-PowerPolicy -RegulatedState 'ca' -Workflow 'ezt'
+        $r.Popup | Should -BeTrue
+        $r.Policy.Regulated | Should -BeTrue
+    }
+    It 'defaults the workflow to MMC (the no-popup profile) when -Workflow is omitted' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA'
+        $r.Popup | Should -BeFalse
+        $r.Policy.Name | Should -Be 'EnergyStar'
+    }
+    It 'an unknown workflow token throws: popup semantics are customer-facing and never guessed' {
+        { Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'XYZ' } | Should -Throw
+    }
+    It 'an empty regulated state fails closed at binding (the state is a required input)' {
+        { Resolve-PowerPolicy -RegulatedState '' } | Should -Throw
+    }
+    It 'a valid saved decision short-circuits detection: FromSaved with the table popup (Q20/Q21)' {
+        $ezt = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'EZT' -SavedDecision 'Apply'
+        (@($ezt.Keys | Sort-Object) -join ',') | Should -Be 'Action,FromSaved,Popup'
+        $ezt.Action | Should -Be 'Apply'
+        $ezt.FromSaved | Should -BeTrue
+        $ezt.Popup | Should -BeTrue
+        $mmc = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'MMC' -SavedDecision 'Decline'
+        $mmc.Action | Should -Be 'Decline'
+        $mmc.FromSaved | Should -BeTrue
+        $mmc.Popup | Should -BeFalse
+    }
+    It 'the saved decision matches case-insensitively, tolerates surrounding whitespace, and returns the canonical token' {
+        foreach ($supplied in @('apply', 'APPLY', ' decline ')) {
+            $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'EZT' -SavedDecision $supplied
+            $r.FromSaved | Should -BeTrue
+        }
+        (Resolve-PowerPolicy -RegulatedState 'CA' -SavedDecision 'apply').Action | Should -Be 'Apply'
+        (Resolve-PowerPolicy -RegulatedState 'CA' -SavedDecision ' decline ').Action | Should -Be 'Decline'
+    }
+    It 'an INVALID saved decision re-asks: NeedsPrompt = $true with the detection table row carried for context (Q21)' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'EZT' -SavedDecision 'Maybe'
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Action,NeedsPrompt,Policy,Popup'
+        $r.NeedsPrompt | Should -BeTrue
+        $r.Action | Should -Be 'Apply'
+        $r.Popup | Should -BeTrue
+        $r.Policy.Regulated | Should -BeTrue
+    }
+    It 'a MISSING saved decision (bound but empty) re-asks the same way (Q21)' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'MMC' -SavedDecision ''
+        $r.NeedsPrompt | Should -BeTrue
+        $r.Action | Should -Be 'Apply'
+        $r.Popup | Should -BeFalse
+        $r.Policy.Regulated | Should -BeTrue
+    }
+    It 'an unbound -SavedDecision is the deployment-time detection: the clean three-key row, no prompt flag (Q23)' {
+        $r = Resolve-PowerPolicy -RegulatedState 'CA' -Workflow 'EZT'
+        @($r.Keys) -contains 'NeedsPrompt' | Should -BeFalse
+        @($r.Keys) -contains 'FromSaved' | Should -BeFalse
+    }
+}
