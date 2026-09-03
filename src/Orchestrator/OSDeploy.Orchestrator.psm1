@@ -2255,3 +2255,303 @@ function Resolve-PowerPolicy {
     }
     return @{ Action = 'Apply'; Popup = $popup; Policy = $policy }
 }
+
+# ---------------------------------------------------------------------------
+# Windows Update phase: the fixed scope, configurable scan/install/reboot
+# cycles, the warn-and-acknowledge leftover, the offline skip, and the
+# unhealthy-after-reboot routing (Q88)
+# ---------------------------------------------------------------------------
+
+function Get-UpdateScope {
+    <#
+        .SYNOPSIS
+        Returns the workflow-FIXED Windows Update scope (Q88 verbatim).
+
+        .DESCRIPTION
+        Q88: updates are SCOPED by fixed include/exclude lists, not by an
+        open 'install everything'. Include = Security, Quality,
+        ServicingStack, DotNet, Defender; Exclude = Preview, Optional,
+        Store, FeatureUpgrade, Driver, Firmware, Bios - exact entries,
+        exact order, verbatim. The scope is workflow-fixed: it takes no
+        parameters and is never filtered per run. Only the CYCLE COUNT is
+        configurable (WindowsUpdate.MaxCycles in the effective
+        configuration; the consumer reads the config and passes
+        -MaxCycles to Invoke-UpdatePhase).
+
+        Returns a FRESH table per call (the module convention): no caller
+        can mutate another caller's lists.
+    #>
+    [CmdletBinding()]
+    param()
+    return @{
+        Include = @('Security', 'Quality', 'ServicingStack', 'DotNet', 'Defender')
+        Exclude = @('Preview', 'Optional', 'Store', 'FeatureUpgrade', 'Driver', 'Firmware', 'Bios')
+    }
+}
+
+# Internal: normalize one category or scope-token name to lowercase
+# alphanumerics so containment comparisons ignore spacing and punctuation
+# ('Servicing Stack Updates' and 'ServicingStack' normalize identically).
+function Get-NormalizedUpdateToken {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    return (($Value.ToLowerInvariant()) -replace '[^a-z0-9]', '')
+}
+
+# Internal: extra category-name needles for the Q88 tokens whose Windows
+# Update classification names do not CONTAIN the token itself: monthly
+# quality updates are classified 'Updates'/'Critical Updates'/'Update
+# Rollups', Defender signatures are 'Definition Updates', and the .NET
+# product family normalizes to 'net'. Real-host validation of this
+# mapping belongs to the host wiring (no Windows host is reachable from
+# this suite); the engine treats it as data.
+$script:UpdateCategoryNeedles = @{
+    quality  = @('updates', 'criticalupdates', 'updaterollups')
+    dotnet   = @('net')
+    defender = @('definitionupdates')
+}
+
+# Internal: classify one found update's category names against the Q88
+# scope. EXCLUDE WINS: an update carrying any excluded category (a
+# preview, a driver, ...) stays out even when another category would
+# include it; then any included category includes the update; anything
+# else is 'OutOfScope' (neither installed nor counted as pending).
+function Test-ScopedUpdateCategory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        $Categories,
+        [Parameter(Mandatory)]$Scope
+    )
+    $excludeNeedles = @()
+    foreach ($token in @((Get-OrchestratorField -Record $Scope -Name 'Exclude'))) {
+        $needle = Get-NormalizedUpdateToken -Value ([string]$token)
+        if ($needle -ne '') { $excludeNeedles += $needle }
+    }
+    $includeNeedles = @()
+    foreach ($token in @((Get-OrchestratorField -Record $Scope -Name 'Include'))) {
+        $needle = Get-NormalizedUpdateToken -Value ([string]$token)
+        if ($needle -ne '') { $includeNeedles += $needle }
+        $extra = $script:UpdateCategoryNeedles[$needle]
+        foreach ($alias in @($extra)) {
+            if ($null -ne $alias -and [string]$alias -ne '') { $includeNeedles += [string]$alias }
+        }
+    }
+    foreach ($category in @($Categories)) {
+        $haystack = Get-NormalizedUpdateToken -Value ([string]$category)
+        if ($haystack -eq '') { continue }
+        foreach ($needle in $excludeNeedles) {
+            if ($haystack.Contains($needle)) { return 'Exclude' }
+        }
+    }
+    foreach ($category in @($Categories)) {
+        $haystack = Get-NormalizedUpdateToken -Value ([string]$category)
+        if ($haystack -eq '') { continue }
+        foreach ($needle in $includeNeedles) {
+            if ($haystack.Contains($needle)) { return 'Include' }
+        }
+    }
+    return 'OutOfScope'
+}
+
+function Invoke-ScopedUpdatePass {
+    <#
+        .SYNOPSIS
+        The REAL scoped Windows Update pass behind the default Scanner.
+
+        .DESCRIPTION
+        Deploy-host-only (the raw Windows Update Agent COM API; tests
+        always Mock this function and inject their own Scanner). One
+        pass = the work of one cycle: search for not-installed,
+        not-hidden updates; classify every find against the Q88 scope
+        (Exclude wins - Test-ScopedUpdateCategory); install the in-scope
+        set; report what the pass found (and installed), whether the
+        engine now needs a reboot, and whether the engine state is
+        healthy. The NEXT cycle's scan confirms nothing remains.
+
+        Fail-visible contract: ANY engine failure - including the COM
+        classes being absent on a non-Windows host - reports
+        Healthy = $false so Invoke-UpdatePhase routes to Technician
+        Review. The pass never throws and never invents a clean scan.
+
+        Report: @{ PendingCount; PendingUpdates (@{ Title } per in-scope
+        update found this pass); RebootRequired; Healthy }.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Context)
+    try {
+        $scope = Get-OrchestratorField -Record $Context -Name 'Scope'
+        if ($null -eq $scope) { $scope = Get-UpdateScope }
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searchResult = $searcher.Search('IsInstalled=0 and IsHidden=0')
+        $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+        $pending = @()
+        foreach ($update in @($searchResult.Updates)) {
+            $categories = @($update.Categories | ForEach-Object { $_.Name })
+            $decision = Test-ScopedUpdateCategory -Categories $categories -Scope $scope
+            if ($decision -eq 'Include') {
+                $null = $toInstall.Add($update)
+                $pending += @{ Title = [string]$update.Title }
+            }
+        }
+        $rebootRequired = $false
+        if (@($pending).Count -gt 0) {
+            $installer = New-Object -ComObject Microsoft.Update.Installer
+            $installResult = $installer.Install($toInstall)
+            $rebootRequired = [bool]$installResult.RebootRequired
+        }
+        return @{
+            PendingCount   = @($pending).Count
+            PendingUpdates = @($pending)
+            RebootRequired = $rebootRequired
+            Healthy        = $true
+        }
+    }
+    catch {
+        return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $false }
+    }
+}
+
+function Invoke-UpdatePhase {
+    <#
+        .SYNOPSIS
+        Runs scoped Windows Update cycles to completion, a
+        warn-and-acknowledge leftover, or the offline skip (Q88).
+
+        .DESCRIPTION
+        SCANNER CONTRACT (the injectable seam): -Scanner is invoked once
+        per cycle with ONE context object
+        @{ Cycle = <1-based cycle number>; Scope = <the Get-UpdateScope
+        table>; RebootCompleted = <bool> } - RebootCompleted is $true
+        only on the FIRST scan after a resumed reboot. The Scanner
+        performs that cycle's Windows Update work (scan the scoped set,
+        install what it found) and returns a report object with at
+        least: PendingCount (in-scope updates this pass found and
+        installed; the next cycle's scan confirms completion),
+        PendingUpdates, RebootRequired [bool] (the engine needs a
+        reboot to finish), and Healthy [bool] (the engine state is
+        healthy; $false on any pass - including the first scan after a
+        reboot - is the unhealthy-after-reboot condition). Hashtable and
+        PSCustomObject reports are both accepted.
+
+        OFFLINE (-Online:$false, the FactoryRecovery shape): returns
+        @{ Ok = $true; Skipped = $true; Warning } WITHOUT ever invoking
+        the Scanner - offline runs never scan for updates and the
+        machine stays eligible (Ok = $true).
+
+        ONLINE: up to -MaxCycles cycles (default 3; the consumer reads
+        WindowsUpdate.MaxCycles from the effective configuration and
+        passes it here). Per cycle, in this order:
+        1. Healthy = $false -> @{ Ok = $false; Outcome =
+           'TechnicianReview' } - fail closed, no Ignore/Continue path;
+           an unhealthy engine's reboot claim is not trusted, so health
+           is judged before anything else.
+        2. RebootRequired = $true -> @{ Ok = $true; RebootPending =
+           $true; CyclesCompleted = <cycle> }. The restart COMPLETES the
+           cycle: the caller initiates the reboot, then resumes with
+           -ResumeContext <that CyclesCompleted value>; the resumed call
+           continues from where it left (the next cycle number) and the
+           first resumed scan runs with RebootCompleted = $true.
+        3. PendingCount = 0 -> complete: @{ Ok = $true; CyclesCompleted
+           = <cycle> } - no acknowledgement, no warning.
+        4. Updates remain -> the next cycle runs.
+        After the last allowed cycle still shows pending:
+        @{ Ok = $true; NeedsAcknowledgement = $true; Warning;
+        CyclesCompleted = <MaxCycles> } - the warn-and-acknowledge
+        completion (Q88): leftover updates are left to normal Windows
+        Update behavior once acknowledged. Resuming with -ResumeContext
+        already at the limit returns the same shape without another
+        scan (the budget is exhausted).
+
+        FAILURE CONTRACT: the phase NEVER throws for scanner-REPORTED
+        conditions - unhealthy, missing, or malformed report fields fail
+        closed to the shapes above (a missing/non-numeric PendingCount
+        is treated as updates remaining, driving toward the visible
+        acknowledgement rather than a silent success). A THROWING
+        Scanner is a caller bug and propagates unchanged. The only
+        throws from this function are parameter-contract violations:
+        MaxCycles below 1, or a negative ResumeContext.
+
+        Default Scanner (when -Scanner is omitted): delegates to the
+        real engine pass Invoke-ScopedUpdatePass (deploy-host-only WUA
+        COM; fail-visible Healthy = $false - see its doc comment).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$MaxCycles = 3,
+        [bool]$Online = $true,
+        [scriptblock]$Scanner,
+        [int]$ResumeContext = 0
+    )
+    if ($MaxCycles -lt 1) {
+        throw ("MaxCycles must be at least 1, got {0}." -f $MaxCycles)
+    }
+    if ($ResumeContext -lt 0) {
+        throw ("ResumeContext must be 0 or more, got {0}." -f $ResumeContext)
+    }
+    if (-not $Online) {
+        return @{
+            Ok      = $true
+            Skipped = $true
+            Warning = 'Windows Update phase skipped: this run is offline (Factory Recovery never scans for updates). The machine stays eligible; updates are left to normal Windows Update behavior.'
+        }
+    }
+    if ($ResumeContext -ge $MaxCycles) {
+        # Resume with the budget exhausted: the last pass left updates
+        # pending a completed restart, and no cycles remain to verify -
+        # the warn-and-acknowledge completion, without another scan.
+        return @{
+            Ok                   = $true
+            NeedsAcknowledgement = $true
+            Warning              = ('Windows Update cycle budget already exhausted ({0} cycle(s)); the last pass left updates pending a completed restart. Acknowledge to finish; the remaining updates are left to normal Windows Update behavior.' -f $MaxCycles)
+            CyclesCompleted      = $MaxCycles
+        }
+    }
+    $scanner = $Scanner
+    if ($null -eq $scanner) {
+        $scanner = { param($Context) return (Invoke-ScopedUpdatePass -Context $Context) }
+    }
+    $scope = Get-UpdateScope
+    # The first scan of a resumed call follows the completed reboot.
+    $rebootCompleted = ($ResumeContext -gt 0)
+    $lastPending = 0
+    for ($cycle = $ResumeContext + 1; $cycle -le $MaxCycles; $cycle++) {
+        $context = @{
+            Cycle           = $cycle
+            Scope           = $scope
+            RebootCompleted = $rebootCompleted
+        }
+        $report = & $scanner $context
+        $rebootCompleted = $false
+        # Health first: an unhealthy engine (including the first scan
+        # after a reboot, the Q88 unhealthy-after-reboot condition) stops
+        # before any further cycle work.
+        if (-not [bool](Get-OrchestratorField -Record $report -Name 'Healthy')) {
+            return @{ Ok = $false; Outcome = 'TechnicianReview' }
+        }
+        if ([bool](Get-OrchestratorField -Record $report -Name 'RebootRequired')) {
+            # The restart completes this cycle; the resumed call
+            # continues at the next cycle number.
+            return @{ Ok = $true; RebootPending = $true; CyclesCompleted = $cycle }
+        }
+        $pendingField = Get-OrchestratorField -Record $report -Name 'PendingCount'
+        $pendingCount = 1
+        if ($null -ne $pendingField) {
+            # A non-numeric report field is a malformed report, never an
+            # escaping cast exception: treat it as updates remaining.
+            try { $pendingCount = [int]$pendingField } catch { $pendingCount = 1 }
+        }
+        $lastPending = $pendingCount
+        if ($pendingCount -eq 0) {
+            return @{ Ok = $true; CyclesCompleted = $cycle }
+        }
+    }
+    return @{
+        Ok                   = $true
+        NeedsAcknowledgement = $true
+        Warning              = ('Windows Update cycles exhausted: {0} cycle(s) ran and {1} scoped update(s) are still pending. Acknowledge to finish; the remaining updates are left to normal Windows Update behavior.' -f $MaxCycles, $lastPending)
+        CyclesCompleted      = $MaxCycles
+    }
+}

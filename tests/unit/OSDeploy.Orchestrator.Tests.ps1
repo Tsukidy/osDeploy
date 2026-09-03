@@ -1914,3 +1914,203 @@ Describe 'Resolve-PowerPolicy decision table and saved-decision handling (Q20-Q2
         @($r.Keys) -contains 'FromSaved' | Should -BeFalse
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 25: Windows Update phase - the fixed scope, configurable cycles, the
+# warn-and-acknowledge leftover, the offline skip, and the unhealthy-after-
+# reboot routing (Q88). None of these tests needs the single-instance lock
+# or an orchestration context. Every scenario drives the phase through an
+# injected FAKE Scanner scriptblock (the documented seam); the
+# default-scanner tests MOCK the module-internal real pass
+# (Invoke-ScopedUpdatePass) the way Tasks 20/23 mock internal helpers.
+# ---------------------------------------------------------------------------
+
+Describe 'Get-UpdateScope fixed workflow scope (Q88)' {
+    It 'returns the Q88-verbatim include and exclude lists, exact entries, exact order, as arrays' {
+        $scope = Get-UpdateScope
+        (@($scope.Keys | Sort-Object) -join ',') | Should -Be 'Exclude,Include'
+        (@($scope.Include) -join ',') | Should -Be 'Security,Quality,ServicingStack,DotNet,Defender'
+        (@($scope.Exclude) -join ',') | Should -Be 'Preview,Optional,Store,FeatureUpgrade,Driver,Firmware,Bios'
+        $scope.Include -is [System.Array] | Should -BeTrue
+        $scope.Exclude -is [System.Array] | Should -BeTrue
+    }
+    It 'returns a FRESH table per call: mutating one result never changes the next' {
+        $first = Get-UpdateScope
+        $first.Include = @('Tampered')
+        $first.Exclude = @()
+        $second = Get-UpdateScope
+        (@($second.Include) -join ',') | Should -Be 'Security,Quality,ServicingStack,DotNet,Defender'
+        (@($second.Exclude) -join ',') | Should -Be 'Preview,Optional,Store,FeatureUpgrade,Driver,Firmware,Bios'
+    }
+}
+
+Describe 'Invoke-UpdatePhase scoped cycles, acknowledgement, and offline skip (Q88)' {
+    It 'completes without acknowledgement when the next cycle confirms nothing remains (all installed first cycle)' {
+        $script:calls = 0
+        $script:contexts = @()
+        $scanner = {
+            param($Context)
+            $script:calls++
+            $script:contexts += $Context
+            if ($script:calls -eq 1) {
+                return @{
+                    PendingCount   = 2
+                    PendingUpdates = @(@{ Title = 'Security update A' }, @{ Title = 'Quality update B' })
+                    RebootRequired = $false
+                    Healthy        = $true
+                }
+            }
+            return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $true }
+        }
+        $r = Invoke-UpdatePhase -Scanner $scanner
+        $r.Ok | Should -BeTrue
+        # The plain completion is exactly two keys: no acknowledgement, no warning.
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'CyclesCompleted,Ok'
+        $r.CyclesCompleted | Should -Be 2
+        $script:calls | Should -Be 2
+        # The scanner saw 1-based cycle numbers and the fixed Q88 scope every time.
+        (@($script:contexts | ForEach-Object { $_.Cycle }) -join ',') | Should -Be '1,2'
+        foreach ($c in @($script:contexts)) {
+            (@($c.Scope.Include) -join ',') | Should -Be (@((Get-UpdateScope).Include) -join ',')
+            (@($c.Scope.Exclude) -join ',') | Should -Be (@((Get-UpdateScope).Exclude) -join ',')
+            $c.RebootCompleted | Should -BeFalse
+        }
+    }
+    It 'warns and requires acknowledgement when updates remain after the configured cycle limit' {
+        $script:calls = 0
+        $scanner = {
+            param($Context)
+            $script:calls++
+            return @{ PendingCount = 1; PendingUpdates = @(@{ Title = 'Stubborn update' }); RebootRequired = $false; Healthy = $true }
+        }
+        $r = Invoke-UpdatePhase -MaxCycles 2 -Scanner $scanner
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'CyclesCompleted,NeedsAcknowledgement,Ok,Warning'
+        $r.Ok | Should -BeTrue
+        $r.NeedsAcknowledgement | Should -BeTrue
+        $r.Warning | Should -Not -BeNullOrEmpty
+        $r.Warning | Should -Match '(?i)pending'
+        $r.CyclesCompleted | Should -Be 2
+        $script:calls | Should -Be 2
+    }
+    It 'offline (-Online:$false) skips with a warning, stays eligible (Ok), and NEVER invokes the scanner' {
+        $script:calls = 0
+        $scanner = {
+            param($Context)
+            $script:calls++
+            return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $true }
+        }
+        $r = Invoke-UpdatePhase -Online:$false -Scanner $scanner
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Ok,Skipped,Warning'
+        $r.Ok | Should -BeTrue
+        $r.Skipped | Should -BeTrue
+        $r.Warning | Should -Not -BeNullOrEmpty
+        $r.Warning | Should -Match '(?i)offline'
+        $script:calls | Should -Be 0
+    }
+    It 'an unhealthy scanner report routes to Technician Review and never throws' {
+        $r = Invoke-UpdatePhase -Scanner {
+            param($Context)
+            return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $false }
+        }
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Ok,Outcome'
+        $r.Ok | Should -BeFalse
+        $r.Outcome | Should -Be 'TechnicianReview'
+    }
+    It 'a malformed scanner report (missing Healthy) fails closed to Technician Review, never a throw' {
+        $r = Invoke-UpdatePhase -Scanner { param($Context) return @{ PendingCount = 0 } }
+        $r.Ok | Should -BeFalse
+        $r.Outcome | Should -Be 'TechnicianReview'
+    }
+    It 'a required reboot mid-cycle records the reboot-pending shape and the resumed call continues from where it left' {
+        $script:calls = 0
+        $script:contexts = @()
+        $scanner = {
+            param($Context)
+            $script:calls++
+            $script:contexts += $Context
+            if ($Context.RebootCompleted) {
+                # The pass after the reboot: everything settled, nothing pending.
+                return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $true }
+            }
+            return @{ PendingCount = 1; PendingUpdates = @(@{ Title = 'Cumulative update' }); RebootRequired = $true; Healthy = $true }
+        }
+        $r1 = Invoke-UpdatePhase -MaxCycles 3 -Scanner $scanner
+        (@($r1.Keys | Sort-Object) -join ',') | Should -Be 'CyclesCompleted,Ok,RebootPending'
+        $r1.Ok | Should -BeTrue
+        $r1.RebootPending | Should -BeTrue
+        # The restart completes the cycle: the return already counts it.
+        $r1.CyclesCompleted | Should -Be 1
+        $script:calls | Should -Be 1
+        # Simulated restart: the caller resumes with the CyclesCompleted value
+        # as -ResumeContext; the first resumed scan runs with RebootCompleted
+        # = $true (the scripted "reboot then continue" key).
+        $r2 = Invoke-UpdatePhase -MaxCycles 3 -ResumeContext $r1.CyclesCompleted -Scanner $scanner
+        (@($r2.Keys | Sort-Object) -join ',') | Should -Be 'CyclesCompleted,Ok'
+        $r2.Ok | Should -BeTrue
+        $r2.CyclesCompleted | Should -Be 2
+        $script:calls | Should -Be 2
+        (@($script:contexts | ForEach-Object { $_.Cycle }) -join ',') | Should -Be '1,2'
+        @($script:contexts)[0].RebootCompleted | Should -BeFalse
+        @($script:contexts)[1].RebootCompleted | Should -BeTrue
+    }
+    It 'an unhealthy scanner result AFTER the reboot routes to Technician Review (Q88 unhealthy-after-reboot)' {
+        $script:calls = 0
+        $scanner = {
+            param($Context)
+            $script:calls++
+            if ($Context.RebootCompleted) {
+                return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $false }
+            }
+            return @{ PendingCount = 1; PendingUpdates = @(); RebootRequired = $true; Healthy = $true }
+        }
+        $r1 = Invoke-UpdatePhase -MaxCycles 3 -Scanner $scanner
+        $r1.RebootPending | Should -BeTrue
+        $r2 = Invoke-UpdatePhase -MaxCycles 3 -ResumeContext 1 -Scanner $scanner
+        (@($r2.Keys | Sort-Object) -join ',') | Should -Be 'Ok,Outcome'
+        $r2.Ok | Should -BeFalse
+        $r2.Outcome | Should -Be 'TechnicianReview'
+    }
+    It 'resuming with the cycle budget already exhausted returns the acknowledgement shape without another scan' {
+        $script:calls = 0
+        $scanner = {
+            param($Context)
+            $script:calls++
+            return @{ PendingCount = 1; PendingUpdates = @(); RebootRequired = $true; Healthy = $true }
+        }
+        $r1 = Invoke-UpdatePhase -MaxCycles 1 -Scanner $scanner
+        $r1.RebootPending | Should -BeTrue
+        $r1.CyclesCompleted | Should -Be 1
+        $r2 = Invoke-UpdatePhase -MaxCycles 1 -ResumeContext 1 -Scanner $scanner
+        (@($r2.Keys | Sort-Object) -join ',') | Should -Be 'CyclesCompleted,NeedsAcknowledgement,Ok,Warning'
+        $r2.Ok | Should -BeTrue
+        $r2.NeedsAcknowledgement | Should -BeTrue
+        $r2.Warning | Should -Not -BeNullOrEmpty
+        $r2.CyclesCompleted | Should -Be 1
+        $script:calls | Should -Be 1
+    }
+    It 'the default Scanner delegates to the real engine pass and maps its report (healthy zero-pending -> complete)' {
+        Mock Invoke-ScopedUpdatePass -ModuleName OSDeploy.Orchestrator {
+            return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $true }
+        }
+        $r = Invoke-UpdatePhase
+        $r.Ok | Should -BeTrue
+        $r.CyclesCompleted | Should -Be 1
+        Should -Invoke Invoke-ScopedUpdatePass -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter {
+            $Context.Cycle -eq 1 -and
+            $Context.RebootCompleted -eq $false -and
+            (@($Context.Scope.Include) -join ',') -eq 'Security,Quality,ServicingStack,DotNet,Defender'
+        }
+    }
+    It 'the default Scanner routes an unhealthy real pass to Technician Review without throwing' {
+        Mock Invoke-ScopedUpdatePass -ModuleName OSDeploy.Orchestrator {
+            return @{ PendingCount = 0; PendingUpdates = @(); RebootRequired = $false; Healthy = $false }
+        }
+        $r = Invoke-UpdatePhase
+        $r.Ok | Should -BeFalse
+        $r.Outcome | Should -Be 'TechnicianReview'
+    }
+    It 'throws on an invalid cycle configuration (MaxCycles below one, negative ResumeContext)' {
+        { Invoke-UpdatePhase -MaxCycles 0 -Scanner { param($Context) } } | Should -Throw
+        { Invoke-UpdatePhase -MaxCycles 2 -ResumeContext -1 -Scanner { param($Context) } } | Should -Throw
+    }
+}
