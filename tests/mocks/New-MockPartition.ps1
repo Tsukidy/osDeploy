@@ -204,8 +204,16 @@ function New-MockPartition {
     Copy-Item -LiteralPath (Join-Path $orchestratorDir 'Part2.psm1') -Destination $runtimeDir -Force
     # Same @{ FileHashes; BundleHash } shape New-IntegrityRecord writes,
     # computed with the Util primitives directly so this FIXTURE never needs
-    # to import the module under test.
+    # to import the module under test. The assign-then-@() unwrap mirrors
+    # Get-FlatInventory exactly: New-FileInventory ends in Write-Output
+    # -NoEnumerate, so the assigned value may still wear its PSObject
+    # wrapper - Windows PowerShell 5.1's ConvertTo-Json serializes that
+    # wrapper as { "value": [...], "Count": n } instead of an array, while
+    # pwsh unwraps it silently (why every Linux run was green). @() re-wraps
+    # into a plain object[] on every engine, matching the module path that
+    # the Windows component run already proved correct.
     $runtimeInventory = New-FileInventory -Path $runtimeDir
+    $runtimeInventory = @($runtimeInventory)
     Write-AtomicJson -Path (Join-Path $stateDir 'IntegrityRecord.json') -Value @{
         FileHashes = $runtimeInventory
         BundleHash = (Get-BundleHash -Inventory $runtimeInventory)

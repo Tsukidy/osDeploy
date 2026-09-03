@@ -535,19 +535,14 @@ catch {
             Assert-True ([bool]$seqReg.Ok) '5.0a the real task registration (suite-unique name) returns Ok before the sequence runs'
             Assert-True ((Test-Path -LiteralPath (Join-Path $script:suitePartition 'State\TaskRegistration.json')) -and (Test-Path -LiteralPath $runtimeDir) -and (Test-Path -LiteralPath (Join-Path $script:suitePartition 'State\BootOverride.json'))) '5.0b the completion footprint (marker, runtime directory, boot override) is staged before the sequence runs'
             $seqStatePath = Join-Path $script:suitePartition 'State\DeploymentState.json'
-            # Pre-flight diagnostic (first Windows run stopped at the entry
-            # integrity gate): probe the fixture's record DIRECTLY so the log
-            # names the failing comparison (Missing/Changed/Extra/BundleHash/
-            # InvalidRecord) and shows the path forms both sides use.
-            $diagRecord = Read-JsonFile -Path (Join-Path $script:suitePartition 'State\IntegrityRecord.json')
-            $diagCheck = Test-Integrity -Directory $runtimeDir -Record $diagRecord
-            $diagFresh = New-FileInventory -Path $runtimeDir
-            $diagRecordPath = [string](Get-SuiteJsonField -Record @(Get-SuiteJsonField -Record $diagRecord -Name 'FileHashes')[0] -Name 'Path')
-            $diagFreshPath = [string](Get-SuiteJsonField -Record @($diagFresh)[0] -Name 'Path')
-            Write-Output ('DIAG 5.0c fixture Test-Integrity: Ok=' + [string]$diagCheck.Ok + ' Mismatches=' + ((@($diagCheck.Mismatches) | ForEach-Object { '{0}:{1}' -f [string](Get-SuiteJsonField -Record $_ -Name 'Path'), [string](Get-SuiteJsonField -Record $_ -Name 'Reason') }) -join ' | '))
-            Write-Output ('DIAG 5.0d path forms - record: [' + $diagRecordPath + ']  fresh: [' + $diagFreshPath + ']')
-            Write-Output ('DIAG 5.0e raw IntegrityRecord.json: ' + ([System.IO.File]::ReadAllText((Join-Path $script:suitePartition 'State\IntegrityRecord.json'))))
-            Write-Output ('DIAG 5.0f in-suite serialization of the same fresh inventory: ' + (ConvertTo-Json -InputObject @{ FileHashes = $diagFresh; BundleHash = 'X' } -Depth 8))
+            # Pre-flight (added after the first Windows run caught a 5.1-only
+            # serialization bug in the fixture): the staged record must
+            # validate clean BEFORE the sequence runs, so a fixture defect
+            # fails here with named mismatches instead of surfacing as a
+            # confusing entry-gate TechnicianReview.
+            $preFlightRecord = Read-JsonFile -Path (Join-Path $script:suitePartition 'State\IntegrityRecord.json')
+            $preFlight = Test-Integrity -Directory $runtimeDir -Record $preFlightRecord
+            Assert-True ([bool]$preFlight.Ok) ('5.0c the fixture integrity record validates clean before the sequence (mismatches: {0})' -f ((@($preFlight.Mismatches) | ForEach-Object { '{0}:{1}' -f [string](Get-SuiteJsonField -Record $_ -Name 'Path'), [string](Get-SuiteJsonField -Record $_ -Name 'Reason') }) -join ' | '))
             $seqResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable)
             Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2}, Reason {3})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result, [string]$seqResult.Reason)
             $seqStateRaw = [System.IO.File]::ReadAllText($seqStatePath)
