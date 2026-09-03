@@ -809,16 +809,47 @@ function Remove-OrchestratorField {
 # caller decides what a missing log means (Task 20: a log-verification block,
 # never an invented log).
 function Get-CurrentRunLog {
+    <#
+        .SYNOPSIS
+        Locate the CURRENT (newest) run folder under a Logs root; prefers the
+        folder belonging to a named run.
+
+        .DESCRIPTION
+        Uses the same ordering key Invoke-LogRetention uses: the
+        <yyyyMMdd-HHmmss> timestamp embedded in the folder name,
+        LastWriteTime as the fallback for foreign names. Returns a
+        log-shaped @{ Folder; EventsPath } object, or $null when the root or
+        its set of run folders is empty - the caller decides what a missing
+        log means (Task 20: a log-verification block, never an invented
+        log).
+
+        -RunId (Q73 fix): when bound and non-empty, run folders whose NAME
+        embeds that RunId are preferred over all newer foreign folders, and
+        the NEWEST of the matching set wins. Without this preference a
+        SECOND INSTANCE's newer folder (Write-SecondInstanceExit creates
+        one) would become 'the current log' and the summary gate would
+        verify the WRONG run's events. The folder name shape
+        <RunType>-<yyyyMMdd-HHmmss>-<RunId> (collision suffixes -2..-99
+        append after the RunId) embeds the RunId verbatim, so a plain
+        substring match selects the run's own folders; an empty, unbound, or
+        unmatched RunId falls back to the plain newest-folder behavior.
+    #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$LogsRoot
+        [Parameter(Mandatory)][string]$LogsRoot,
+        [string]$RunId = ''
     )
     if (-not (Test-Path -LiteralPath $LogsRoot)) { return $null }
     $folders = @(Get-ChildItem -LiteralPath $LogsRoot -Directory -ErrorAction SilentlyContinue)
     if ($folders.Count -eq 0) { return $null }
+    $candidates = @($folders)
+    if (-not [string]::IsNullOrEmpty($RunId)) {
+        $candidates = @($folders | Where-Object { $_.Name.Contains($RunId) })
+        if ($candidates.Count -eq 0) { $candidates = @($folders) }
+    }
     $best = $null
     $bestKey = ''
-    foreach ($folder in $folders) {
+    foreach ($folder in $candidates) {
         $key = $folder.LastWriteTime.ToString('yyyyMMdd-HHmmss')
         $match = [regex]::Match($folder.Name, '(\d{8}-\d{6})')
         if ($match.Success) { $key = $match.Groups[1].Value }
@@ -836,23 +867,36 @@ function Get-CurrentRunLog {
 function Invoke-Cleanup {
     <#
         .SYNOPSIS
-        Q89 scoped cleanup: remove the completion runtime footprint, retain
-        all recovery content.
+        Q89 scoped cleanup: retire the Scheduled Task, remove the completion
+        runtime footprint, retain all recovery content.
 
         .DESCRIPTION
-        Removes EXACTLY two targets and nothing else:
-        1. The Scheduled Task registration marker
+        Performs EXACTLY three things and nothing else, every target
+        attempted so one failure never hides another:
+        1. Unregisters the orchestrator's Scheduled Task through
+           Unregister-OrchestratorTask (Q89: 'cleanup removes the task').
+           The task name comes from the registration MARKER when it is
+           readable - the marker written by Register-OrchestratorTask is
+           the authority for which task this partition staged - and falls
+           back to -TaskName otherwise. On a non-Windows host the
+           unregistration is the documented Windows-only no-op (one
+           warning, nothing removed), so the unit suites stay green; a
+           Windows failure throws inside Unregister-OrchestratorTask and is
+           collected as a cleanup failure here.
+        2. Removes the Scheduled Task registration marker
            <PartitionRoot>\State\TaskRegistration.json (the file Task 28's
            Register-OrchestratorTask writes).
-        2. The orchestrator runtime artifacts directory
+        3. Removes the orchestrator runtime artifacts directory
            <PartitionRoot>\OrchestratorRuntime\ entirely (the simulated
-           C:\ProgramData\OSDeploy\Orchestrator).
+           C:\ProgramData\OSDeploy\Orchestrator; Q90's integrity-protected
+           staged copy, spent once the run completes).
 
         NEVER touched: Sources, ImageCache, State\FactoryProfile*,
-        State\effective-config*, Logs, and every other partition path. The
-        function never enumerates the partition - it addresses only the two
-        named targets - so the retained recovery set is structurally safe
-        rather than protected by a filter list.
+        State\effective-config*, State\IntegrityRecord.json, Logs, and
+        every other partition path. The function never enumerates the
+        partition - it addresses only the named targets - so the retained
+        recovery set is structurally safe rather than protected by a
+        filter list.
 
         Failure contract: a marker path occupied by a DIRECTORY is reported
         as a removal failure instead of recursed into or prompted about.
@@ -863,12 +907,13 @@ function Invoke-Cleanup {
         This classification is deterministic on every platform and is how
         the tests simulate an undeletable marker.
 
-        Returns @{ Ok; Failures }: Ok = $true when both removals succeeded
-        or were already absent (idempotent - an already-clean partition is
-        a success); otherwise $false with one Failures message per failed
-        target. Every target is attempted so one failure never hides
-        another. TaskName only labels the failure detail; it defaults to
-        the same task name Register-OrchestratorTask defaults to.
+        Returns @{ Ok; Failures }: Ok = $true when every step succeeded or
+        was already absent (idempotent - an already-clean partition is a
+        success; Unregister-OrchestratorTask is itself safe to call twice);
+        otherwise $false with one Failures message per failed target.
+        TaskName also labels the fallback unregistration and the failure
+        detail; it defaults to the same task name
+        Register-OrchestratorTask defaults to.
     #>
     [CmdletBinding()]
     param(
@@ -878,6 +923,37 @@ function Invoke-Cleanup {
     $failures = @()
     $markerPath = Join-Path $PartitionRoot 'State\TaskRegistration.json'
     $runtimePath = Join-Path $PartitionRoot 'OrchestratorRuntime'
+
+    # --- 1. Retire the Scheduled Task itself (Q89) --------------------------
+    # The marker records WHICH task this partition registered; read it
+    # before it is removed. A missing, unreadable, or malformed marker
+    # (including a directory squatting on the path) falls back to the
+    # -TaskName parameter.
+    $retireName = $TaskName
+    try {
+        $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction Stop
+        if (-not $markerItem.PSIsContainer) {
+            $marker = Read-JsonFile -Path $markerPath
+            $markerName = [string](Get-OrchestratorField -Record $marker -Name 'TaskName')
+            if (-not [string]::IsNullOrWhiteSpace($markerName)) { $retireName = $markerName }
+        }
+    }
+    catch { }
+    try {
+        # $null result = the non-Windows no-op branch (one warning, nothing
+        # removed); a Windows result carries Ok, and a Windows failure
+        # throws and is collected below.
+        $unregistered = Unregister-OrchestratorTask -TaskName $retireName
+        if ($null -ne $unregistered) {
+            $unregOk = Get-OrchestratorField -Record $unregistered -Name 'Ok'
+            if ($null -ne $unregOk -and -not [bool]$unregOk) {
+                $failures += ("Scheduled Task '{0}' could not be retired by Unregister-OrchestratorTask." -f $retireName)
+            }
+        }
+    }
+    catch {
+        $failures += ("Scheduled Task '{0}' could not be retired: {1}" -f $retireName, $_.Exception.Message)
+    }
 
     if (Test-Path -LiteralPath $markerPath) {
         $markerItem = Get-Item -LiteralPath $markerPath -Force
@@ -1003,7 +1079,10 @@ function Complete-Deployment {
         return @{ Completed = $false; BlockedBy = 'CleanupFailure' }
     }
 
-    $log = Get-CurrentRunLog -LogsRoot (Join-Path $PartitionRoot 'Logs')
+    # Q73 fix: verify THIS run's own log (the folder embedding the
+    # checkpoint's RunId), never a newer foreign folder a second instance
+    # may have created in the meantime.
+    $log = Get-CurrentRunLog -LogsRoot (Join-Path $PartitionRoot 'Logs') -RunId ([string](Get-OrchestratorField -Record $state -Name 'RunId'))
     $logOk = $false
     if ($null -ne $log) {
         try {
@@ -3101,6 +3180,177 @@ function Invoke-LogFinalization {
 # successful entry.
 $script:SequencePartitionRoot = ''
 
+# Internal: parse the staged effective-config snapshot. Returns $null when
+# the file is absent; parse errors propagate to the caller's fail-closed
+# contract. The document shape is Save-ConfigSnapshot's:
+# { Values; Version; Source; Fallbacks; Warnings; SavedUtc } - the resolved
+# VALUES live under .Values, NOT at the top level (final-review F1: a
+# top-level read silently ignored every configured value and always fell
+# back to the engine defaults).
+function Read-StagedConfigSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot
+    )
+    $snapshotPath = Join-Path $PartitionRoot 'Sources\Config\effective-config.json'
+    if (-not (Test-Path -LiteralPath $snapshotPath)) { return $null }
+    return (Read-JsonFile -Path $snapshotPath)
+}
+
+# Internal: best-effort structured event into the CURRENT run's OWN log
+# (RunId-preferred folder selection). Q84 config-provenance and Q90
+# integrity events must never BLOCK the spine: any failure (no run folder
+# yet, unwritable events file) is swallowed - the host wrapper creates the
+# run folder at launch, so on the deployed host the events always land.
+function Write-ConductorEvent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][string]$Event,
+        [hashtable]$Data = @{}
+    )
+    try {
+        $log = Get-CurrentRunLog -LogsRoot (Join-Path $PartitionRoot 'Logs') -RunId $RunId
+        if ($null -eq $log) { return }
+        Add-LogEvent -Log $log -Event $Event -Data $Data
+    }
+    catch { }
+}
+
+# Internal: the deploy-host-only REAL system identity behind the conductor's
+# DEFAULT identity provider (final-review F4). MachineId is the SMBIOS
+# machine UUID (Win32_ComputerSystemProduct.UUID); DiskId is the boot disk's
+# unique id (Get-Disk). Both commands are Windows-only: on any other host
+# the class/disk query fails and the function THROWS - fail visible, exactly
+# like the Get-PnpDevice rescan in FinalValidation - because identity is
+# established positively or not at all. The exact DiskId derivation may be
+# refined by the host wiring as long as it stays deterministic per machine;
+# the injectable -IdentityProvider parameter is the seam for that.
+function Get-RealSystemIdentity {
+    [CmdletBinding()]
+    param()
+    $machine = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
+    $machineId = [string]$machine.UUID
+    $bootDisk = Get-Disk -ErrorAction Stop |
+        Where-Object { $_.IsBoot } |
+        Select-Object -First 1
+    $diskId = ''
+    if ($null -ne $bootDisk) { $diskId = [string]$bootDisk.UniqueId }
+    if ([string]::IsNullOrWhiteSpace($machineId) -or [string]::IsNullOrWhiteSpace($diskId)) {
+        throw 'Get-RealSystemIdentity could not establish the machine or disk identity (empty value); identity is established positively or not at all.'
+    }
+    return @{ MachineId = $machineId; DiskId = $diskId }
+}
+
+# Internal: the Q35 identity-on-return gate for conductor re-entry. Runs
+# ONLY when the loaded checkpoint carries RebootPending = $true (a restart
+# is outstanding: 'validate identity on return'). Expected identity comes
+# from State\ReadinessRecord.json (the staging-time record); ACTUAL identity
+# comes from the injectable provider. Both MachineId AND DiskId must match
+# case-insensitively, and neither side may be empty - the same positive-
+# establishment rule Resume-AfterReboot applies. A match clears the durable
+# marker through the tested engine path (Resume-AfterReboot re-validates the
+# STATE identity against the same record and checkpoints RebootPending =
+# $false). ANY failure - unreadable readiness record, throwing or malformed
+# provider, or a genuine mismatch - returns Outcome 'IdentityMismatch' with
+# a distinguishing Reason: identity that cannot be established positively is
+# never a pass, the caller stops fail-closed, and NOTHING is mutated.
+function Invoke-IdentityEntryGate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][scriptblock]$Provider
+    )
+    $readinessPath = Join-Path $PartitionRoot 'State\ReadinessRecord.json'
+    $expectedMachine = ''
+    $expectedDisk = ''
+    try {
+        $readiness = Read-JsonFile -Path $readinessPath
+        $expectedMachine = [string](Get-OrchestratorField -Record $readiness -Name 'MachineId')
+        $expectedDisk = [string](Get-OrchestratorField -Record $readiness -Name 'DiskId')
+    }
+    catch { }
+    if ([string]::IsNullOrWhiteSpace($expectedMachine) -or [string]::IsNullOrWhiteSpace($expectedDisk)) {
+        return @{ Ok = $false; Outcome = 'IdentityMismatch'; Reason = 'ReadinessRecordUnavailable' }
+    }
+    $actual = $null
+    try { $actual = & $Provider }
+    catch {
+        return @{ Ok = $false; Outcome = 'IdentityMismatch'; Reason = 'IdentityProviderFailed' }
+    }
+    $actualMachine = [string](Get-OrchestratorField -Record $actual -Name 'MachineId')
+    $actualDisk = [string](Get-OrchestratorField -Record $actual -Name 'DiskId')
+    if ([string]::IsNullOrWhiteSpace($actualMachine) -or [string]::IsNullOrWhiteSpace($actualDisk)) {
+        return @{ Ok = $false; Outcome = 'IdentityMismatch'; Reason = 'IdentityProviderFailed' }
+    }
+    $machineOk = ($actualMachine -eq $expectedMachine)
+    $diskOk = ($actualDisk -eq $expectedDisk)
+    if (-not ($machineOk -and $diskOk)) {
+        return @{ Ok = $false; Outcome = 'IdentityMismatch'; Reason = 'IdentityMismatch' }
+    }
+    $resume = Resume-AfterReboot -Expected @{ MachineId = $expectedMachine; DiskId = $expectedDisk }
+    if ([string]$resume.Outcome -ne 'Ready') {
+        return @{ Ok = $false; Outcome = 'IdentityMismatch'; Reason = 'IdentityMismatch' }
+    }
+    return @{ Ok = $true }
+}
+
+# Internal: the Q90/Q92 orchestrator-integrity entry gate. Before first
+# execution and after every restart (i.e., on every conductor entry that
+# will run phase work), the staged orchestrator copy is rechecked against
+# the staging-time integrity record:
+# - Directory: <PartitionRoot>\OrchestratorRuntime - the suite stand-in for
+#   the deployed C:\ProgramData\OSDeploy\Orchestrator the bootstrap stages.
+# - Record: <PartitionRoot>\State\IntegrityRecord.json - stored 'with the
+#   authoritative deployment state on the recovery partition' (Q90).
+# - Repair source: <PartitionRoot>\Sources\Orchestrator - the LOCAL
+#   partition recovery content ONLY (Q91: the parameter list of
+#   Repair-FromLocalSource cannot even express a server path).
+# A healthy recheck passes silently (one IntegrityValidated event). A failed
+# recheck routes through local-only repair and revalidation; a repair that
+# still fails validation is a blocking Technician Review - no Ignore/
+# Continue-Anyway path, zero phase work, zero state mutation. A missing or
+# unparseable record is a STAGING error and stops the same way: the record
+# is staging-time truth and is never re-recorded or defaulted at runtime.
+# Validation and refresh results land in the run's own log (Q90).
+function Invoke-EntryIntegrityGate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [Parameter(Mandatory)][string]$RunId
+    )
+    $orchestratorHome = Join-Path $PartitionRoot 'OrchestratorRuntime'
+    $repairSource = Join-Path $PartitionRoot 'Sources\Orchestrator'
+    $recordPath = Join-Path $PartitionRoot 'State\IntegrityRecord.json'
+    if (-not (Test-Path -LiteralPath $recordPath)) {
+        Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityRecordMissing'
+        return @{ Ok = $false; Outcome = 'TechnicianReview'; Reason = 'IntegrityRecordMissing' }
+    }
+    $record = $null
+    try {
+        $record = Read-JsonFile -Path $recordPath
+    }
+    catch {
+        Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityRecordInvalid'
+        return @{ Ok = $false; Outcome = 'TechnicianReview'; Reason = 'IntegrityRecordInvalid' }
+    }
+    $check = Test-Integrity -Directory $orchestratorHome -Record $record
+    if ([bool]$check.Ok) {
+        Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityValidated'
+        return @{ Ok = $true }
+    }
+    Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityRepairStarted'
+    $repair = Repair-FromLocalSource -Directory $orchestratorHome -RepairSource $repairSource -Record $record
+    if ([bool]$repair.Repaired) {
+        Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityRepaired'
+        return @{ Ok = $true }
+    }
+    Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $RunId -Event 'IntegrityRepairFailed'
+    return @{ Ok = $false; Outcome = 'TechnicianReview'; Reason = 'IntegrityRepairFailed' }
+}
+
 function New-PhaseAction {
     <#
         .SYNOPSIS
@@ -3134,9 +3384,10 @@ function New-PhaseAction {
           stays in Audit Mode behind a blocking review). Any other
           workflow token THROWS - workflow semantics are never guessed.
         - WindowsUpdate: Invoke-UpdatePhase online with MaxCycles read
-          from the staged effective configuration
-          (Sources\Config\effective-config.json, Q88), defaulting to the
-          engine default 3 when the file or field is absent. A
+          from the staged effective configuration's Values
+          (Sources\Config\effective-config.json -> .Values.WindowsUpdate.
+          MaxCycles, Q88/Q84), defaulting to the engine default 3 when the
+          file or field is absent. A
           RebootRequired report is translated into the sequence-level
           restart signal (Set-OrchestrationRestartRequested); the
           post-reboot cycle continuation (-ResumeContext) is re-driven by
@@ -3160,9 +3411,10 @@ function New-PhaseAction {
           review, never a skip - the sequence must not complete behind an
           unregistered or unvalidated Factory Recovery entry.
         - LogFinalization: Invoke-LogFinalization (the Q73 pre-cleanup
-          summary gate) on the CURRENT run log - the newest run folder
-          under <PartitionRoot>\Logs, located with Get-CurrentRunLog. The
-          scheduled-task host wrapper creates the run folder at launch;
+          summary gate) on the CURRENT run log - the run's OWN folder under
+          <PartitionRoot>\Logs (RunId-preferred Get-CurrentRunLog
+          selection; a second instance's newer folder is never verified).
+          The scheduled-task host wrapper creates the run folder at launch;
           the sequence deliberately does not. No run folder at all, or
           SummaryMayClose = $false, is a phase failure.
         - Cleanup: a deliberate no-op success. The destructive removal is
@@ -3215,12 +3467,15 @@ function New-PhaseAction {
         'WindowsUpdate' {
             return {
                 $maxCycles = 3
-                $snapshotPath = Join-Path $script:SequencePartitionRoot 'Sources\Config\effective-config.json'
-                if (Test-Path -LiteralPath $snapshotPath) {
-                    # A parse failure throws (fail closed into the attempt
+                $snapshot = Read-StagedConfigSnapshot -PartitionRoot $script:SequencePartitionRoot
+                if ($null -ne $snapshot) {
+                    # F1: the resolved values live under .Values (the
+                    # Save-ConfigSnapshot shape), never at the top level. A
+                    # parse failure throws (fail closed into the attempt
                     # engine); only an absent file or field falls back to 3.
-                    $snapshot = Read-JsonFile -Path $snapshotPath
-                    $section = Get-OrchestratorField -Record $snapshot -Name 'WindowsUpdate'
+                    $values = Get-OrchestratorField -Record $snapshot -Name 'Values'
+                    $section = $null
+                    if ($null -ne $values) { $section = Get-OrchestratorField -Record $values -Name 'WindowsUpdate' }
                     $field = $null
                     if ($null -ne $section) { $field = Get-OrchestratorField -Record $section -Name 'MaxCycles' }
                     if ($null -ne $field) { $maxCycles = [int]$field }
@@ -3266,7 +3521,10 @@ function New-PhaseAction {
         }
         'LogFinalization' {
             return {
-                $log = Get-CurrentRunLog -LogsRoot (Join-Path $script:SequencePartitionRoot 'Logs')
+                $state = (Get-RequiredContext).State
+                # RunId-preferred selection (Q73 fix): verify THIS run's own
+                # log, never a newer foreign folder a second instance created.
+                $log = Get-CurrentRunLog -LogsRoot (Join-Path $script:SequencePartitionRoot 'Logs') -RunId ([string](Get-OrchestratorField -Record $state -Name 'RunId'))
                 if ($null -eq $log) { return $false }
                 $r = Invoke-LogFinalization -Log $log
                 if (-not $r.SummaryMayClose) { return $false }
@@ -3296,7 +3554,34 @@ function Invoke-DeploymentSequence {
         The conductor over the whole installed-Windows deployment sequence.
         Enter-Orchestrator provides the single-instance gate and loads the
         authoritative checkpoint from <PartitionRoot>\State\
-        DeploymentState.json (the file is the only state source). Every
+        DeploymentState.json (the file is the only state source). A loaded
+        checkpoint that already carries a Result is a POST-COMPLETION
+        restart (Q89): the conductor delegates IMMEDIATELY to
+        Invoke-PostCompletionRestart (cleanup only - no entry gates, no
+        phase machinery) and returns the PostCompletionRestart shape.
+        Otherwise, in order: ONE config-provenance event is written to the
+        run's own log (Q84: source, version, and fallbacks from the staged
+        effective-config snapshot), then the ENTRY GATES run before any
+        phase work:
+        1. Identity gate (Q35 'validate identity on return') - ONLY when
+           the checkpoint carries RebootPending = $true. Expected identity
+           comes from State\ReadinessRecord.json, actual identity from the
+           -IdentityProvider scriptblock (invoked with no arguments; must
+           return @{ MachineId; DiskId }). The DEFAULT provider is the
+           deploy-host-only Get-RealSystemIdentity (fail visible on any
+           non-Windows host, like the Get-PnpDevice rescan). Any failure -
+           unreadable readiness record, throwing or malformed provider, or
+           a genuine mismatch - returns @{ Outcome = 'IdentityMismatch' }
+           with a distinguishing Reason: a fail-closed stop with ZERO phase
+           work, ZERO destructive steps, and ZERO state mutation. A match
+           clears the durable marker through Resume-AfterReboot.
+        2. Integrity gate (Q90/Q92) - the staged orchestrator copy
+           (OrchestratorRuntime) is rechecked against
+           State\IntegrityRecord.json; a failed recheck routes through
+           local-only repair (Sources\Orchestrator, Q91) and revalidation,
+           and a repair that still fails stops at the blocking Technician
+           Review with zero phase work. See Invoke-EntryIntegrityGate.
+        Every
         phase in Get-PhaseOrder is then handed to Invoke-Phase with the
         mapped action scriptblock; attempts, per-attempt checkpointing,
         reboot marking, and idempotent resume (a completed phase's action is
@@ -3346,7 +3631,18 @@ function Invoke-DeploymentSequence {
            $false; Result = $null } - the phase exhausted its automatic
            attempts (or returned a blocking failure shape); the sequence
            stopped. The caller blocks - there is no Ignore/Continue-Anyway
-           path.
+           path. An ENTRY-GATE stop carries the same Outcome with Phase =
+           $null plus a Reason ('IntegrityRecordMissing',
+           'IntegrityRecordInvalid', or 'IntegrityRepairFailed'): zero
+           phases ran and the checkpoint was not written.
+        - @{ Outcome = 'IdentityMismatch'; Phase = $null; Completed =
+           $false; Result = $null; Reason = <'IdentityMismatch' |
+           'IdentityProviderFailed' | 'ReadinessRecordUnavailable'> } - the
+           re-entry identity gate failed: a restart was outstanding and the
+           machine/disk identity could not be positively re-established.
+           Fail-closed stop with zero mutation; the technician decides
+           whether the disk moved or the record is wrong - there is no
+           Ignore/Continue-Anyway path.
         - @{ Outcome = 'Blocked'; Phase = 'Cleanup'; Completed = $false;
            BlockedBy = <Complete-Deployment token>; Result = $null } -
            Complete-Deployment refused to record completion
@@ -3371,7 +3667,8 @@ function Invoke-DeploymentSequence {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PartitionRoot,
-        [hashtable]$PhaseRunners
+        [hashtable]$PhaseRunners,
+        [scriptblock]$IdentityProvider
     )
     if ($null -ne $PhaseRunners) {
         $known = Get-PhaseOrder
@@ -3393,6 +3690,92 @@ function Invoke-DeploymentSequence {
     # module scope because the single-instance contract admits exactly one
     # conductor per process at a time.
     $script:SequencePartitionRoot = $PartitionRoot
+    $state = $entry.State
+    $runId = [string](Get-OrchestratorField -Record $state -Name 'RunId')
+
+    # Post-completion restart (Q89): a Result already recorded means this
+    # entry runs CLEANUP ONLY. Delegating here (before any gate or phase
+    # machinery) also keeps the entry integrity gate off the completed
+    # partition, whose orchestrator home was already removed by cleanup.
+    $recordedResult = Get-OrchestratorField -Record $state -Name 'Result'
+    $resultIsSet = ($null -ne $recordedResult)
+    if ($resultIsSet -and $recordedResult -is [string] -and $recordedResult -eq '') {
+        $resultIsSet = $false
+    }
+    if ($resultIsSet) {
+        $post = Invoke-PostCompletionRestart -PartitionRoot $PartitionRoot
+        return @{
+            Outcome   = 'PostCompletionRestart'
+            Phase     = 'Cleanup'
+            Completed = $true
+            Ok        = [bool]$post['Ok']
+            Result    = $null
+        }
+    }
+
+    # Q84: ONE config-provenance event at run start - the staging source,
+    # resolved version, and applied fallbacks from the staged snapshot.
+    # Purely informational (ASCII, no key material, no server paths) and
+    # best-effort: an absent or unreadable snapshot is recorded as such,
+    # never invented.
+    $provenance = @{
+        Source    = ''
+        Version   = ''
+        Fallbacks = @()
+    }
+    try {
+        $snapshot = Read-StagedConfigSnapshot -PartitionRoot $PartitionRoot
+        if ($null -ne $snapshot) {
+            $provenance['Source'] = [string](Get-OrchestratorField -Record $snapshot -Name 'Source')
+            $provenance['Version'] = [string](Get-OrchestratorField -Record $snapshot -Name 'Version')
+            $fallbacks = Get-OrchestratorField -Record $snapshot -Name 'Fallbacks'
+            if ($null -ne $fallbacks) { $provenance['Fallbacks'] = @($fallbacks) }
+        }
+        else {
+            $provenance['Source'] = '(snapshot missing)'
+        }
+    }
+    catch {
+        $provenance['Source'] = '(snapshot unreadable)'
+    }
+    Write-ConductorEvent -PartitionRoot $PartitionRoot -RunId $runId -Event 'ConfigProvenance' -Data $provenance
+
+    # Entry gate 1 (Q35): validate identity on return, only when a restart
+    # is outstanding.
+    $rebootPending = Get-OrchestratorField -Record $state -Name 'RebootPending'
+    if ($null -ne $rebootPending -and [bool]$rebootPending) {
+        $provider = $IdentityProvider
+        if ($null -eq $provider) {
+            # Deploy-host-only default (fail visible on any non-Windows
+            # host); tests and host wiring inject through -IdentityProvider.
+            $provider = { Get-RealSystemIdentity }
+        }
+        $identityGate = Invoke-IdentityEntryGate -PartitionRoot $PartitionRoot -RunId $runId -Provider $provider
+        if (-not [bool]$identityGate.Ok) {
+            return @{
+                Outcome   = 'IdentityMismatch'
+                Phase     = $null
+                Completed = $false
+                Result    = $null
+                Reason    = $identityGate.Reason
+            }
+        }
+    }
+
+    # Entry gate 2 (Q90/Q92): recheck the staged orchestrator before first
+    # execution and after restarts; repair locally, stop at review on the
+    # second failure.
+    $integrityGate = Invoke-EntryIntegrityGate -PartitionRoot $PartitionRoot -RunId $runId
+    if (-not [bool]$integrityGate.Ok) {
+        return @{
+            Outcome   = 'TechnicianReview'
+            Phase     = $null
+            Completed = $false
+            Result    = $null
+            Reason    = $integrityGate.Reason
+        }
+    }
+
     $order = Get-PhaseOrder
     foreach ($phase in $order) {
         $action = $null

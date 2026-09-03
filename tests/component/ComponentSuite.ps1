@@ -41,7 +41,7 @@
 #      OSDCloud Deployment Partition staged on the real filesystem:
 #      contract-valid end state, scoped cleanup (marker, boot override,
 #      runtime directory removed; recovery content retained), log
-#      verification, and the scheduled task itself surviving cleanup.
+#      verification, and the scheduled task itself retired by cleanup.
 #   6. Integrity record -> tamper detection -> local-only repair (Q90/Q92):
 #      stage a record over a copy of the orchestrator source, flip a byte
 #      and delete a file, Test-Integrity fails closed, Repair-FromLocalSource
@@ -506,7 +506,7 @@ catch {
         try {
             Write-Output ''
             Write-Output 'Check 5: Invoke-DeploymentSequence full run against a fresh mock partition'
-            Write-Output 'NOTE 5.0 PhaseRunners injections for determinism on this VM: Drivers and Applications (real engines, stubbed host executors), WindowsUpdate (real cycle engine, clean-report scanner), FinalValidation (real validator, empty rescan), BootEntryRegistration (real wrapper incl. BootOverride clearing, contract-valid BootTool report). Real default bodies ran for WorkflowSpecifics (EZT recorder), Activation, LogFinalization, Cleanup, and Complete-Deployment.'
+            Write-Output 'NOTE 5.0 PhaseRunners injections for determinism on this VM: Drivers and Applications (real engines, stubbed host executors), WindowsUpdate (real cycle engine, clean-report scanner), FinalValidation (real validator, empty rescan), BootEntryRegistration (real wrapper incl. BootOverride clearing, contract-valid BootTool report). Real default bodies ran for WorkflowSpecifics (EZT recorder), Activation, LogFinalization, Cleanup, and Complete-Deployment, and the REAL entry gates ran: config-provenance event and the Q90 integrity recheck over the staged orchestrator home (RebootPending is clear at first entry, so the identity gate is not in play here).'
             $script:suitePartition = New-MockPartition -Path (Join-Path $script:workspace 'SequencePartition')
             # Host-wrapper role: the scheduled-task host creates the run
             # folder at launch; the sequence deliberately does not.
@@ -516,9 +516,13 @@ catch {
             # writes the real marker (suite-unique task name), the runtime
             # artifacts directory and the one-time boot override are staged.
             $seqReg = Register-OrchestratorTask -PartitionRoot $script:suitePartition -TaskName $script:seqTaskName
+            # OrchestratorRuntime is no longer staged with foreign cache
+            # files: it is the Q90 integrity-protected orchestrator home
+            # (New-MockPartition stages the exact copy and its record), and
+            # an extra file would be repaired away at the entry gate. The
+            # runtime directory itself plus the one-time boot override are
+            # the rest of the completion footprint.
             $runtimeDir = Join-Path $script:suitePartition 'OrchestratorRuntime'
-            $null = New-Item -ItemType Directory -Path $runtimeDir -Force
-            [System.IO.File]::WriteAllText((Join-Path $runtimeDir 'task-cache.bin'), 'runtime artifact', [System.Text.Encoding]::ASCII)
             Write-AtomicJson -Path (Join-Path $script:suitePartition 'State\BootOverride.json') -Value @{
                 Source  = 'PXE bootstrap'
                 OneTime = $true
@@ -557,7 +561,8 @@ catch {
             Assert-True ($missingRetained.Count -eq 0) ('5.7 recovery content is retained through cleanup (missing: {0})' -f ($missingRetained -join ', '))
             Assert-True ((Test-Path -LiteralPath $runLog.EventsPath) -and [bool](Complete-RunLog -Log $runLog)) '5.8 the verified run log survives cleanup and still re-parses as valid JSONL'
             $seqTaskAfter = Get-ScheduledTask -TaskName $script:seqTaskName -ErrorAction SilentlyContinue
-            Assert-True ($null -ne $seqTaskAfter) '5.9 cleanup removed only the MARKER; the scheduled task itself survives (Unregister-OrchestratorTask owns task removal)' -HintOnFail 'Get-ScheduledTask -TaskName without -TaskPath matches the name in ANY task folder; a same-named task in another folder can satisfy or confuse this lookup.'
+            Assert-True ($null -eq $seqTaskAfter) '5.9 cleanup retired the SCHEDULED TASK ITSELF as well as the marker (Q89: cleanup removes the task; Invoke-Cleanup unregisters by the marker task name)' -HintOnFail 'Get-ScheduledTask -TaskName without -TaskPath matches the name in ANY task folder; a same-named task in another folder can satisfy or confuse this lookup.'
+            Assert-True (([System.IO.File]::ReadAllText($runLog.EventsPath)) -match 'ConfigProvenance' -and ([System.IO.File]::ReadAllText($runLog.EventsPath)) -match 'IntegrityValidated') '5.10 the entry gates logged the config provenance and integrity validation events into the run own log (Q84/Q90)'
         }
         catch {
             Assert-True $false ('5.ABORT the full-sequence check group aborted with an unexpected error: ' + $_.Exception.Message)
@@ -696,7 +701,7 @@ catch {
         try {
             Write-Output ''
             Write-Output 'Check 8: phase handoffs write contract-valid state'
-            Write-Output 'NOTE 8.0 PhaseRunners injections in this group: the Check 5 determinism table wherever phases still run; the 8.3 scenario injects Drivers with a restart-request action; the 8.8 scenario deliberately leaves BootEntryRegistration on its DEFAULT wiring so the REAL bcdedit-based boot check runs and fails closed.'
+            Write-Output 'NOTE 8.0 PhaseRunners injections in this group: the Check 5 determinism table wherever phases still run; the 8.3 scenario injects Drivers with a restart-request action; the 8.5 re-entry injects the IDENTITY PROVIDER with the mock partition staged identity (the real provider reports this VM actual identity, which never matches the mock GUIDs); the 8.8 scenario deliberately leaves BootEntryRegistration on its DEFAULT wiring so the REAL bcdedit-based boot check runs and fails closed.'
 
             # 8.1: a second in-process launch exits without work or mutation.
             # The mutex Check 5's entry still holds IS the second-instance
@@ -735,9 +740,22 @@ catch {
             Assert-True ((@($rebootResume.CompletedPhases) -join ',') -eq 'Drivers' -and [bool]$rebootResume.RebootPending -and [bool]$rebootValidation.Valid) '8.4 the pre-reboot checkpoint is contract-valid: Drivers completed, RebootPending durable'
 
             # 8.5-8.7: the post-reboot re-entry completes without re-running
-            # the completed phase.
+            # the completed phase. The checkpoint carries RebootPending, so
+            # the entry IDENTITY gate runs; the suite injects the provider
+            # reporting the mock partition's staged identity (the REAL
+            # Get-RealSystemIdentity provider reports this VM's actual
+            # machine/disk identity, which by construction never matches the
+            # mock partition's fixed GUIDs). $script:suitePartition is read
+            # at INVOCATION time, like the runner table does.
             Reset-OrchestratorForNextEntry
-            $resumeResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable)
+            $stagedIdentityProvider = {
+                $readiness = Read-JsonFile -Path (Join-Path $script:suitePartition 'State\ReadinessRecord.json')
+                return @{
+                    MachineId = [string](Get-SuiteJsonField -Record $readiness -Name 'MachineId')
+                    DiskId    = [string](Get-SuiteJsonField -Record $readiness -Name 'DiskId')
+                }
+            }
+            $resumeResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable) -IdentityProvider $stagedIdentityProvider
             Assert-True ($resumeResult.Outcome -eq 'Completed' -and [string]$resumeResult.Result -eq 'Completed') ('8.5 the post-reboot re-entry completes the sequence (found Outcome {0})' -f [string]$resumeResult.Outcome)
             $finalResume = Get-ResumePoint -Path $handoffStatePath
             $driversCount = @($finalResume.CompletedPhases | Where-Object { $_ -eq 'Drivers' }).Count

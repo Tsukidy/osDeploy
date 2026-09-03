@@ -100,7 +100,12 @@ function Invoke-LogRetention {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Root,
-        [int]$MaxMB = 512,
+        # 1024 matches the central configuration default
+        # (Logging.LocalLogHistoryMaxMB; only OSDeploy.Config may own
+        # defaults). Consumers read that key from the effective
+        # configuration and pass it explicitly; the default only exists so a
+        # bare call cannot exceed the configured ceiling.
+        [int]$MaxMB = 1024,
         [string]$KeepFolder = ''
     )
     if (-not (Test-Path -LiteralPath $Root)) { return }

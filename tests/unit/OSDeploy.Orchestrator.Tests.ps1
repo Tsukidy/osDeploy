@@ -753,6 +753,35 @@ Describe 'Invoke-Cleanup scoped removal and recovery retention (Q89)' {
         $named = Invoke-Cleanup -PartitionRoot $script:troot -TaskName 'Custom Task 99'
         $named.Failures[0] | Should -Match ([regex]::Escape('Custom Task 99'))
     }
+    It 'retires the Scheduled Task itself, using the task name recorded in the registration marker (Q89)' {
+        Mock Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator {
+            return @{ Ok = $true; TaskName = 'Custom Registered Task'; Existed = $true }
+        }
+        # The marker (written by Register-OrchestratorTask) is the authority
+        # for WHICH task this partition's cleanup retires.
+        Write-AtomicJson -Path (Join-Path $script:troot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'Custom Registered Task'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        $r = Invoke-Cleanup -PartitionRoot $script:troot
+        $r.Ok | Should -BeTrue
+        Should -Invoke Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter { $TaskName -eq 'Custom Registered Task' }
+    }
+    It 'falls back to the parameter task name when no marker exists, and reports a failed unregistration as a cleanup failure' {
+        Remove-Item -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') -Force
+        Mock Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator {
+            return @{ Ok = $true; TaskName = 'OSDeploy Orchestrator'; Existed = $false }
+        }
+        $r = Invoke-Cleanup -PartitionRoot $script:troot
+        $r.Ok | Should -BeTrue
+        Should -Invoke Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter { $TaskName -eq 'OSDeploy Orchestrator' }
+        # A throwing unregistration (the Windows body throws fail-closed) is
+        # collected as a cleanup failure, never swallowed.
+        Mock Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator { throw 'unregistration refused' }
+        $failed = Invoke-Cleanup -PartitionRoot $script:troot
+        $failed.Ok | Should -BeFalse
+        @($failed.Failures | Where-Object { $_ -match 'unregistration refused' }).Count | Should -Be 1
+    }
 }
 
 Describe 'Complete-Deployment Q89 completion gating' {
@@ -877,6 +906,14 @@ Describe 'Complete-Deployment Q89 completion gating' {
         Test-Path -LiteralPath (Join-Path $script:troot 'State\TaskRegistration.json') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $script:troot 'OrchestratorRuntime') | Should -BeTrue
         (Get-FileHash -LiteralPath $script:statePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+    It 'completion retires the Scheduled Task itself through cleanup (Q89: cleanup removes the task)' {
+        Mock Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator {
+            return @{ Ok = $true; TaskName = 'OSDeploy Orchestrator'; Existed = $true }
+        }
+        $r = Complete-Deployment -PartitionRoot $script:troot -Handoff 'Completed'
+        $r.Completed | Should -BeTrue
+        Should -Invoke Unregister-OrchestratorTask -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter { $TaskName -eq 'OSDeploy Orchestrator' }
     }
 }
 
@@ -2637,10 +2674,19 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
     }
     BeforeEach {
         $script:sroot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-seq-' + [guid]::NewGuid().ToString('N')))
-        $log = New-RunLog -Root (Join-Path $script:sroot 'Logs') -RunType 'InitialDeployment'
+        # The run's OWN run folder, named with the checkpoint's RunId exactly
+        # as the scheduled-task host wrapper does; every RunId-preferred log
+        # lookup (the Q73 fix) below resolves to it.
+        $log = New-RunLog -Root (Join-Path $script:sroot 'Logs') -RunType 'InitialDeployment' -RunId '11111111-1111-1111-1111-111111111111'
         Add-LogEvent -Log $log -Event 'SuiteFixture'
         $script:srootEvents = $log.EventsPath
         $script:srootStatePath = Join-Path $script:sroot 'State\DeploymentState.json'
+        # The mock partition's fixed identity (state + readiness record agree).
+        $script:mockIdentity = @{
+            MachineId = '22222222-2222-2222-2222-222222222222'
+            DiskId    = '33333333-3333-3333-3333-333333333333'
+        }
+        $script:matchingProvider = { return $script:mockIdentity }
         $m = Get-OrchestratorMutex
         if ($null -ne $m) {
             try { $m.ReleaseMutex() } catch { }
@@ -2735,9 +2781,12 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
             $rp.RebootPending | Should -BeTrue
             # Leg 2: this process never entered (BeforeEach reset it AFTER the
             # previous test and BEFORE the child ran). Fresh context, file-only
-            # state, counting runners - the Scheduled Task re-entry shape.
+            # state, counting runners - the Scheduled Task re-entry shape. The
+            # crashed checkpoint carries RebootPending = $true, so the entry
+            # identity gate runs; the injected provider reports the mock
+            # identity (the Windows component suite exercises the real one).
             $runners2 = New-SequenceRunners -Phases $script:seqPhases
-            $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+            $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2 -IdentityProvider $script:matchingProvider
             $r2.Outcome | Should -Be 'Completed'
             $r2.Result | Should -Be 'Completed'
             # ZERO already-completed actions re-invoked; the incomplete phase
@@ -2773,7 +2822,9 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
         (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate'
         $rp.RebootPending | Should -BeTrue
         # Simulated restart: fresh module, file-only state; the Scheduled Task
-        # at next boot re-enters the sequence.
+        # at next boot re-enters the sequence WITH the identity gate (the
+        # checkpoint carries RebootPending), satisfied here by the injected
+        # matching provider.
         $m = Get-OrchestratorMutex
         if ($null -ne $m) {
             try { $m.ReleaseMutex() } catch { }
@@ -2781,7 +2832,7 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
         }
         Import-Module $script:modulePath -Force
         $runners2 = New-SequenceRunners -Phases $script:seqPhases
-        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2 -IdentityProvider $script:matchingProvider
         $r2.Outcome | Should -Be 'Completed'
         $r2.Result | Should -Be 'Completed'
         foreach ($done in @('Drivers', 'Applications', 'WorkflowSpecifics', 'WindowsUpdate')) {
@@ -2790,6 +2841,8 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
         foreach ($fresh in @('Activation', 'FinalValidation', 'BootEntryRegistration')) {
             $script:seqCounts[$fresh] | Should -Be 1
         }
+        # The identity gate cleared the durable restart marker.
+        (Get-ResumePoint -Path $script:srootStatePath).RebootPending | Should -BeFalse
     }
     It 'stops the sequence at BootEntryRegistration review when the boot entry is Blocked (default action, fail closed)' {
         # The completion footprint is staged to prove a blocked boot entry
@@ -2899,6 +2952,161 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
         $final = Read-JsonFile -Path $script:srootStatePath
         $final.Result | Should -Be 'Completed'
         ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+    }
+    It 'drives the DEFAULT WindowsUpdate action with the CONFIGURED MaxCycles from the snapshot Values (Q84/Q88)' {
+        # F1 regression: the snapshot written by the real Save-ConfigSnapshot
+        # is { Values: { WindowsUpdate: { MaxCycles } }, Version, Source,
+        # Fallbacks, Warnings, SavedUtc }; a reader of top-level
+        # $snapshot.WindowsUpdate silently sees nothing and falls back to 3.
+        $repoConfigPath = Join-Path $PSScriptRoot '..\..\config\osdeploy-config.json'
+        $tempConfig = Join-Path ([System.IO.Path]::GetTempPath()) ('cfg-' + [guid]::NewGuid().ToString('N') + '.json')
+        try {
+            $raw = [System.IO.File]::ReadAllText($repoConfigPath, [System.Text.Encoding]::ASCII)
+            $raw = $raw.Replace('"MaxCycles": 3', '"MaxCycles": 2')
+            [System.IO.File]::WriteAllText($tempConfig, $raw, [System.Text.Encoding]::ASCII)
+            $effective = Resolve-Config -ConfigPath $tempConfig
+            Save-ConfigSnapshot -Effective $effective -Path (Join-Path $script:sroot 'Sources\Config\effective-config.json')
+            # The real path proves the staged value is genuinely configured,
+            # not hand-written JSON.
+            [int]$effective.Values.WindowsUpdate.MaxCycles | Should -Be 2
+            $script:capturedMaxCycles = 0
+            Mock Invoke-UpdatePhase -ModuleName OSDeploy.Orchestrator {
+                $script:capturedMaxCycles = $MaxCycles
+                return @{ Ok = $true; CyclesCompleted = 1 }
+            }
+            $runners = New-SequenceRunners -Phases (@($script:seqPhases) | Where-Object { $_ -ne 'WindowsUpdate' })
+            $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+            $r.Outcome | Should -Be 'Completed'
+            $script:capturedMaxCycles | Should -Be 2
+            Should -Invoke Invoke-UpdatePhase -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It
+        }
+        finally {
+            Remove-Item -Force $tempConfig -ErrorAction SilentlyContinue
+        }
+    }
+    It 'logs the config provenance event and the integrity validation event into the run own log (Q84/Q90)' {
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'Completed'
+        $eventsText = [System.IO.File]::ReadAllText($script:srootEvents)
+        $eventsText | Should -Match 'ConfigProvenance'
+        # Provenance records the staging source: the repository central config
+        # the mock builder resolved. No key material, no server paths.
+        $eventsText | Should -Match 'osdeploy-config\.json'
+        $eventsText | Should -Match 'IntegrityValidated'
+    }
+    It 'repairs a tampered orchestrator copy from the LOCAL repair source at entry, then the run proceeds (Q90/Q92)' {
+        # Flip one byte of the staged orchestrator copy; the entry recheck
+        # must fail, recopy from Sources\Orchestrator (Q91: local partition
+        # only), revalidate, and only then run phases. The scenario blocks at
+        # the DEFAULT BootEntryRegistration (fail visible on this host), so
+        # the REPAIRED copy is still inspectable - completion's cleanup
+        # removes OrchestratorRuntime and would take the evidence with it.
+        $part1 = Join-Path $script:sroot 'OrchestratorRuntime\Part1.psm1'
+        $bytes = [System.IO.File]::ReadAllBytes($part1)
+        if ($bytes[0] -eq 35) { $bytes[0] = 36 } else { $bytes[0] = 35 }
+        [System.IO.File]::WriteAllBytes($part1, $bytes)
+        $expectedHash = (Get-FileHash -LiteralPath (Join-Path $script:sroot 'Sources\Orchestrator\Part1.psm1') -Algorithm SHA256).Hash
+        $phases = @('Drivers', 'Applications', 'WorkflowSpecifics', 'WindowsUpdate', 'Activation', 'FinalValidation')
+        $runners = New-SequenceRunners -Phases $phases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Phase | Should -Be 'BootEntryRegistration'
+        # The repaired copy is byte-identical to the local repair source and
+        # still present (cleanup never ran).
+        (Get-FileHash -LiteralPath $part1 -Algorithm SHA256).Hash | Should -Be $expectedHash
+        Test-Path -LiteralPath $part1 | Should -BeTrue
+        ([System.IO.File]::ReadAllText($script:srootEvents)) | Should -Match 'IntegrityRepairStarted'
+        ([System.IO.File]::ReadAllText($script:srootEvents)) | Should -Match 'IntegrityRepaired'
+        foreach ($phase in $phases) { $script:seqCounts[$phase] | Should -Be 1 }
+    }
+    It 'stops at blocking Technician Review with ZERO phase work when the repaired copy still fails validation (Q90)' {
+        # Tamper the deployed copy AND the repair source identically: the
+        # recopy restores damaged bytes, the recheck fails again, and the
+        # second failure is a blocking review - no Ignore/Continue path.
+        foreach ($copy in @(
+            (Join-Path $script:sroot 'OrchestratorRuntime\Part1.psm1'),
+            (Join-Path $script:sroot 'Sources\Orchestrator\Part1.psm1'))) {
+            $bytes = [System.IO.File]::ReadAllBytes($copy)
+            if ($bytes[0] -eq 35) { $bytes[0] = 36 } else { $bytes[0] = 35 }
+            [System.IO.File]::WriteAllBytes($copy, $bytes)
+        }
+        $before = (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Phase | Should -BeNullOrEmpty
+        $r.Completed | Should -BeFalse
+        $r.Reason | Should -Be 'IntegrityRepairFailed'
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        # Fail-closed stop: no phase work, no state write, no completion.
+        (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Not -Match 'CompletedUtc'
+        ([System.IO.File]::ReadAllText($script:srootEvents)) | Should -Match 'IntegrityRepairFailed'
+    }
+    It 'stops at blocking Technician Review when the integrity record itself is missing (staging is never assumed)' {
+        Remove-Item -LiteralPath (Join-Path $script:sroot 'State\IntegrityRecord.json') -Force
+        $before = (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Reason | Should -Be 'IntegrityRecordMissing'
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+    It 'on re-entry with RebootPending, a MISMATCHING identity provider stops with IdentityMismatch and zero mutation (Q35)' {
+        # Drive to a RebootPending checkpoint first.
+        $runners = New-SequenceRunners -Phases @('Drivers', 'Applications', 'WorkflowSpecifics')
+        $runners['WindowsUpdate'] = { Set-OrchestrationRestartRequested; return $true }
+        $r1 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r1.Outcome | Should -Be 'RebootPending'
+        $before = (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+        $wrongDrive = @{
+            MachineId = '22222222-2222-2222-2222-222222222222'
+            DiskId    = '99999999-9999-9999-9999-999999999999'
+        }
+        $runners2 = New-SequenceRunners -Phases $script:seqPhases
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2 -IdentityProvider { return $wrongDrive }
+        $r2.Outcome | Should -Be 'IdentityMismatch'
+        $r2.Completed | Should -BeFalse
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        # Fail-closed stop: zero mutation, CompletedPhases intact, the marker
+        # stays durable so the next entry gates again.
+        (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
+        $rp = Get-ResumePoint -Path $script:srootStatePath
+        $rp.RebootPending | Should -BeTrue
+        (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate'
+    }
+    It 'the DEFAULT identity provider fails visible on a non-Windows host and stops fail-closed (deploy-host-only pattern)' {
+        if ([System.Environment]::OSVersion.Platform -eq 'Win32NT') {
+            Set-ItResult -Skipped -Because 'this It asserts the non-Windows fail-visible default; the real provider is the component suite job'
+        }
+        # RebootPending checkpoint, then re-entry WITHOUT a provider: the
+        # default deploy-host-only provider cannot establish identity here,
+        # and identity is established positively or not at all.
+        $runners = New-SequenceRunners -Phases @('Drivers', 'Applications', 'WorkflowSpecifics')
+        $runners['WindowsUpdate'] = { Set-OrchestrationRestartRequested; return $true }
+        $r1 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r1.Outcome | Should -Be 'RebootPending'
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+        $before = (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash
+        $runners2 = New-SequenceRunners -Phases $script:seqPhases
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+        $r2.Outcome | Should -Be 'IdentityMismatch'
+        $r2.Reason | Should -Be 'IdentityProviderFailed'
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
     }
     It 'throws on an unknown phase name or a non-scriptblock runner in PhaseRunners (fail closed, before any entry)' {
         Get-OrchestratorMutex | Should -BeNullOrEmpty
@@ -3026,5 +3234,79 @@ Describe 'Windows-only mechanics no-op contract (Task 28)' {
         $err.Exception.Message | Should -Match 'UNC'
         $errFwd = { Register-OrchestratorTask -PartitionRoot '//deployment/DeploymentShare' -SkipNoop } | Should -Throw -PassThru
         $errFwd.Exception.Message | Should -Match 'UNC'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave: the Q73 run-log selection fix (Get-CurrentRunLog
+# prefers the folder embedding the checkpoint's RunId over a NEWER foreign
+# folder - a second instance's SecondInstanceExit folder must never become
+# the log the summary gate verifies).
+# ---------------------------------------------------------------------------
+
+Describe 'Get-CurrentRunLog RunId-preferred selection (Q73 fix)' {
+    BeforeEach {
+        $script:ridroot = Join-Path ([System.IO.Path]::GetTempPath()) ('orch-rid-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path $script:ridroot 'Logs') -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:ridroot -ErrorAction SilentlyContinue
+    }
+    It 'prefers the folder embedding the RunId even when a newer foreign folder exists' {
+        $own = New-RunLog -Root (Join-Path $script:ridroot 'Logs') -RunId '11111111-1111-1111-1111-111111111111' -RunType 'InitialDeployment'
+        Add-LogEvent -Log $own -Event 'OwnRun'
+        # A second instance exits one second later: its folder is NEWER.
+        Start-Sleep -Seconds 1
+        $foreign = New-RunLog -Root (Join-Path $script:ridroot 'Logs') -RunType 'InitialDeployment'
+        Add-LogEvent -Log $foreign -Event 'SecondInstanceExit'
+        # Get-CurrentRunLog is module-internal: invoke it inside the module's
+        # own session state (the exported consumers prove it end-to-end in
+        # the It below).
+        $logsRoot = Join-Path $script:ridroot 'Logs'
+        $log = & (Get-Module OSDeploy.Orchestrator) { param($Root, $Id) Get-CurrentRunLog -LogsRoot $Root -RunId $Id } $logsRoot '11111111-1111-1111-1111-111111111111'
+        $log.Folder | Should -Be $own.Folder
+        # Without a RunId (or with no match) the newest folder still wins.
+        $newest = & (Get-Module OSDeploy.Orchestrator) { param($Root, $Id) Get-CurrentRunLog -LogsRoot $Root -RunId $Id } $logsRoot ''
+        $newest.Folder | Should -Be $foreign.Folder
+        $nomatch = & (Get-Module OSDeploy.Orchestrator) { param($Root, $Id) Get-CurrentRunLog -LogsRoot $Root -RunId $Id } $logsRoot 'aaaaaaaa-0000-0000-0000-000000000000'
+        $nomatch.Folder | Should -Be $foreign.Folder
+    }
+    It 'prefers the NEWEST folder among several matching the RunId (collision suffixes)' {
+        # Same RunType and RunId for both: within one second the collision
+        # suffix ('-2') makes the LATER name sort greater; across seconds the
+        # later timestamp key wins - the second-created folder wins either
+        # way, deterministically.
+        $first = New-RunLog -Root (Join-Path $script:ridroot 'Logs') -RunId '22222222-2222-2222-2222-222222222222' -RunType 'InitialDeployment'
+        Add-LogEvent -Log $first -Event 'First'
+        $second = New-RunLog -Root (Join-Path $script:ridroot 'Logs') -RunId '22222222-2222-2222-2222-222222222222' -RunType 'InitialDeployment'
+        Add-LogEvent -Log $second -Event 'Second'
+        $logsRoot = Join-Path $script:ridroot 'Logs'
+        $log = & (Get-Module OSDeploy.Orchestrator) { param($Root, $Id) Get-CurrentRunLog -LogsRoot $Root -RunId $Id } $logsRoot '22222222-2222-2222-2222-222222222222'
+        $log.Folder | Should -Be $second.Folder
+    }
+    It 'Complete-Deployment verifies the run OWN log, not a newer corrupt foreign folder' {
+        $troot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-own-' + [guid]::NewGuid().ToString('N')))
+        try {
+            # The run's own folder, named with the checkpoint RunId, healthy.
+            $own = New-RunLog -Root (Join-Path $troot 'Logs') -RunId '11111111-1111-1111-1111-111111111111' -RunType 'InitialDeployment'
+            Add-LogEvent -Log $own -Event 'OwnRun'
+            $statePath = Join-Path $troot 'State\DeploymentState.json'
+            $state = Read-JsonFile -Path $statePath
+            $state.CompletedPhases = @('Drivers', 'Applications')
+            $null = New-Checkpoint -State $state -Path $statePath
+            # One second later a second instance exits and its events file is
+            # corrupt: the newest-folder heuristic would verify THIS folder
+            # and block completion forever.
+            Start-Sleep -Seconds 1
+            $foreign = New-RunLog -Root (Join-Path $troot 'Logs') -RunType 'InitialDeployment'
+            Add-LogEvent -Log $foreign -Event 'SecondInstanceExit'
+            [System.IO.File]::AppendAllText($foreign.EventsPath, 'this line is not json' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+            $r = Complete-Deployment -PartitionRoot $troot -Handoff 'Completed'
+            $r.Completed | Should -BeTrue
+            $r.Result | Should -Be 'Completed'
+        }
+        finally {
+            Remove-Item -Recurse -Force $troot -ErrorAction SilentlyContinue
+        }
     }
 }

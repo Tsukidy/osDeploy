@@ -12,6 +12,8 @@
 #   State\FactoryProfile.json                  Update-FactoryProfile (active copy)
 #   State\FactoryProfile.lastknowngood.json    Update-FactoryProfile (backup copy)
 #   State\ReadinessRecord.json                 Write-AtomicJson; passes Test-ReadinessRecord
+#   State\IntegrityRecord.json                 New-IntegrityRecord over OrchestratorRuntime
+#                                               (the Q90 orchestrator integrity record)
 #   Sources\Orchestrator\Part1.psm1, Part2.psm1    dummy orchestrator repair source
 #   Sources\Apps\EZT\manifest.json             one-entry app manifest array
 #   Sources\Apps\MMC\manifest.json             one-entry app manifest array
@@ -19,12 +21,20 @@
 #   Sources\Drivers\Gigabyte\B650\LAN\installer.exe     dummy payload
 #   Sources\Config\effective-config.json       Save-ConfigSnapshot of Resolve-Config run
 #                                               on the repository config\osdeploy-config.json
+#   OrchestratorRuntime\Part1.psm1, Part2.psm1 the staged orchestrator copy (the
+#                                               suite stand-in for the deployed
+#                                               C:\ProgramData\OSDeploy\Orchestrator;
+#                                               exact-copy validated by the Q90 entry
+#                                               gate, repaired only from Sources\Orchestrator)
 #   ImageCache\                                empty directory
 #   Logs\                                      empty directory
 #
 # Ordering contract: Sources is staged BEFORE the readiness BundleHash is
 # computed (Get-BundleHash over New-FileInventory of the staged Sources tree)
 # so the recorded hash is internally consistent with the tree it describes.
+# OrchestratorRuntime is staged with the SAME two files as the repair source
+# and its integrity record is computed AFTER both copies exist, so the record
+# is internally consistent with the exact staged copy it attests (Q90).
 #
 # Fixture choices (documented per the task brief):
 #   - Identity values are GUID-shaped FIXED test strings, so assertions are
@@ -78,16 +88,19 @@ function New-MockPartition {
     $asusChipsetDir  = Join-Path $sourcesDir 'Drivers\Asus\PRIME\Chipset'
     $gigabyteLanDir  = Join-Path $sourcesDir 'Drivers\Gigabyte\B650\LAN'
     $configDir       = Join-Path $sourcesDir 'Config'
+    $runtimeDir      = Join-Path $root 'OrchestratorRuntime'
     $imageCacheDir   = Join-Path $root 'ImageCache'
     $logsDir         = Join-Path $root 'Logs'
     foreach ($dir in @($stateDir, $orchestratorDir, $appsEztDir, $appsMmcDir,
                        $asusChipsetDir, $gigabyteLanDir, $configDir,
-                       $imageCacheDir, $logsDir)) {
+                       $runtimeDir, $imageCacheDir, $logsDir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     # Rebuild determinism: ImageCache and Logs must be EMPTY directories, so
-    # any leftover content from a previous build at this path is removed.
-    foreach ($dir in @($imageCacheDir, $logsDir)) {
+    # any leftover content from a previous build at this path is removed. The
+    # staged orchestrator copy is cleared the same way so the Q90 integrity
+    # record computed below always attests exactly the freshly staged files.
+    foreach ($dir in @($imageCacheDir, $logsDir, $runtimeDir)) {
         Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force
     }
@@ -178,6 +191,25 @@ function New-MockPartition {
         if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
     }
     Update-FactoryProfile -Directory $stateDir -Profile $factoryProfile
+
+    # --- Orchestrator home + State: Q90 integrity record --------------------
+    # The bootstrap stages the orchestrator into its deployed location (the
+    # suite stand-in is <root>\OrchestratorRuntime, the simulated
+    # C:\ProgramData\OSDeploy\Orchestrator) and records the automatically
+    # computed SHA-256 inventory on the partition State (Q90). The repair
+    # source stays Sources\Orchestrator (Q91: local partition only). The
+    # record is computed AFTER the copy exists so it attests exactly the
+    # staged content.
+    Copy-Item -LiteralPath (Join-Path $orchestratorDir 'Part1.psm1') -Destination $runtimeDir -Force
+    Copy-Item -LiteralPath (Join-Path $orchestratorDir 'Part2.psm1') -Destination $runtimeDir -Force
+    # Same @{ FileHashes; BundleHash } shape New-IntegrityRecord writes,
+    # computed with the Util primitives directly so this FIXTURE never needs
+    # to import the module under test.
+    $runtimeInventory = New-FileInventory -Path $runtimeDir
+    Write-AtomicJson -Path (Join-Path $stateDir 'IntegrityRecord.json') -Value @{
+        FileHashes = $runtimeInventory
+        BundleHash = (Get-BundleHash -Inventory $runtimeInventory)
+    }
 
     # --- State: ReadinessRecord.json ----------------------------------------
     # BundleHash is computed from the ALREADY-STAGED Sources tree so the

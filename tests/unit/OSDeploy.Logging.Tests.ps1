@@ -48,6 +48,14 @@ Describe 'event lines' {
     }
 }
 Describe 'retention' {
+    It 'defaults MaxMB to 1024 - only OSDeploy.Config may own defaults, and the central config default is 1024' {
+        # Assert on the command DEFINITION: script-function parameters do not
+        # reliably surface a typed DefaultValue through parameter
+        # introspection, and the default is a contract worth RED-testing.
+        $definition = (Get-Command Invoke-LogRetention).Definition
+        $definition | Should -Match 'MaxMB\s*=\s*1024'
+        $definition | Should -Not -Match 'MaxMB\s*=\s*512'
+    }
     It 'prunes oldest complete folders first and keeps the active one' {
         $runs = Join-Path $root 'ret'
         New-Item -ItemType Directory -Path $runs | Out-Null
