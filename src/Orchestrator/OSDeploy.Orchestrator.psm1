@@ -3447,9 +3447,11 @@ function Invoke-DeploymentSequence {
 # time - never at import time - so module import stays clean on hosts where
 # those cmdlets do not exist.
 #
-# Q91 boundary: every path parameter is a LOCAL path. A UNC path
-# ('\\server\share\...') throws before any work; no function here names,
-# accepts, or probes DeploymentShare or any deployment server.
+# Q91 boundary: every path parameter is a LOCAL path. A UNC path throws
+# before any work, in BOTH spellings - '\\server\share\...' and the
+# forward-slash form '//server/share/...' that Windows file APIs normalize
+# to UNC. No function here names, accepts, or probes DeploymentShare or any
+# deployment server.
 # ---------------------------------------------------------------------------
 
 function Set-OrchestratorAcl {
@@ -3487,7 +3489,7 @@ function Set-OrchestratorAcl {
         Write-Warning ("Set-OrchestratorAcl: Windows only; no ACL work was performed on host platform '{0}'." -f [System.Environment]::OSVersion.Platform)
         return
     }
-    if ($Directory.StartsWith('\\')) {
+    if ($Directory.StartsWith('\\') -or $Directory.StartsWith('//')) {
         throw ("Set-OrchestratorAcl: -Directory must be a local path; the UNC path '{0}' is never accepted (Q91: no DeploymentShare or server path)." -f $Directory)
     }
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -3594,7 +3596,7 @@ function Register-OrchestratorTask {
         Write-Warning ("Register-OrchestratorTask: Windows only; no Scheduled Task was registered on host platform '{0}'." -f [System.Environment]::OSVersion.Platform)
         return
     }
-    if ($PartitionRoot.StartsWith('\\')) {
+    if ($PartitionRoot.StartsWith('\\') -or $PartitionRoot.StartsWith('//')) {
         throw ("Register-OrchestratorTask: -PartitionRoot must be a local partition path; the UNC path '{0}' is never accepted (Q91: no DeploymentShare or server path)." -f $PartitionRoot)
     }
     if (-not (Test-Path -LiteralPath $PartitionRoot -PathType Container)) {

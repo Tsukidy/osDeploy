@@ -3013,12 +3013,18 @@ Describe 'Windows-only mechanics no-op contract (Task 28)' {
     }
     It 'Set-OrchestratorAcl rejects a UNC directory path before any ACL work (Q91 boundary)' {
         # Platform-independent validation: the UNC guard sits after the
-        # no-op guard, so -SkipNoop reaches it on every host.
+        # no-op guard, so -SkipNoop reaches it on every host. Both UNC
+        # spellings are rejected - Windows file APIs normalize '//server/
+        # share' to a UNC path just like the backslash form.
         $err = { Set-OrchestratorAcl -Directory '\\deployment\DeploymentShare\runtime' -SkipNoop } | Should -Throw -PassThru
         $err.Exception.Message | Should -Match 'UNC'
+        $errFwd = { Set-OrchestratorAcl -Directory '//deployment/DeploymentShare/runtime' -SkipNoop } | Should -Throw -PassThru
+        $errFwd.Exception.Message | Should -Match 'UNC'
     }
     It 'Register-OrchestratorTask rejects a UNC partition path before any registration work (Q91 boundary)' {
         $err = { Register-OrchestratorTask -PartitionRoot '\\deployment\DeploymentShare' -SkipNoop } | Should -Throw -PassThru
         $err.Exception.Message | Should -Match 'UNC'
+        $errFwd = { Register-OrchestratorTask -PartitionRoot '//deployment/DeploymentShare' -SkipNoop } | Should -Throw -PassThru
+        $errFwd.Exception.Message | Should -Match 'UNC'
     }
 }
