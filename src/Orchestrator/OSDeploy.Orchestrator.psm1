@@ -3260,7 +3260,6 @@ function Invoke-IdentityEntryGate {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PartitionRoot,
-        [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][scriptblock]$Provider
     )
     $readinessPath = Join-Path $PartitionRoot 'State\ReadinessRecord.json'
@@ -3315,6 +3314,14 @@ function Invoke-IdentityEntryGate {
 # unparseable record is a STAGING error and stops the same way: the record
 # is staging-time truth and is never re-recorded or defaulted at runtime.
 # Validation and refresh results land in the run's own log (Q90).
+# KNOWN BEHAVIOR: a LogVerification-blocked re-entry (cleanup already removed
+# OrchestratorRuntime, Result still null) shows an all-Missing signature, so
+# this gate re-stages the home from the repair source on every retry boot -
+# the retried completion then removes it again. The cycle is deliberate:
+# the record cannot distinguish 'cleanup removed the home' from 'corruption
+# did', and repairing toward the staging-time truth is the fail-closed
+# direction Q90 specifies. No data is at risk (Sources\Orchestrator is
+# immutable recovery content) and the outcome stays Blocked.
 function Invoke-EntryIntegrityGate {
     [CmdletBinding()]
     param(
@@ -3591,10 +3598,7 @@ function Invoke-DeploymentSequence {
         next boot, and Enter-Orchestrator reloads the checkpoint then. A
         crash mid-sequence (power loss) leaves the checkpoint recording
         exactly the completed prefix plus the in-flight attempt; the next
-        entry resumes by invoking ONLY the incomplete phase's action. The
-        Q35 post-reboot IDENTITY gate (Resume-AfterReboot) is the host
-        wiring's step before re-entry - this function deliberately performs
-        no identity comparison of its own.
+        entry resumes by invoking ONLY the incomplete phase's action.
 
         ACTION MAPPING: each PHASE_ORDER entry resolves to an action through
         -PhaseRunners first (a hashtable of phase name -> scriptblock; the
@@ -3750,7 +3754,7 @@ function Invoke-DeploymentSequence {
             # host); tests and host wiring inject through -IdentityProvider.
             $provider = { Get-RealSystemIdentity }
         }
-        $identityGate = Invoke-IdentityEntryGate -PartitionRoot $PartitionRoot -RunId $runId -Provider $provider
+        $identityGate = Invoke-IdentityEntryGate -PartitionRoot $PartitionRoot -Provider $provider
         if (-not [bool]$identityGate.Ok) {
             return @{
                 Outcome   = 'IdentityMismatch'
