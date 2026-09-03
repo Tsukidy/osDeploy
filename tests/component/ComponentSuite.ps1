@@ -546,6 +546,8 @@ catch {
             $diagFreshPath = [string](Get-SuiteJsonField -Record @($diagFresh)[0] -Name 'Path')
             Write-Output ('DIAG 5.0c fixture Test-Integrity: Ok=' + [string]$diagCheck.Ok + ' Mismatches=' + ((@($diagCheck.Mismatches) | ForEach-Object { '{0}:{1}' -f [string](Get-SuiteJsonField -Record $_ -Name 'Path'), [string](Get-SuiteJsonField -Record $_ -Name 'Reason') }) -join ' | '))
             Write-Output ('DIAG 5.0d path forms - record: [' + $diagRecordPath + ']  fresh: [' + $diagFreshPath + ']')
+            Write-Output ('DIAG 5.0e raw IntegrityRecord.json: ' + ([System.IO.File]::ReadAllText((Join-Path $script:suitePartition 'State\IntegrityRecord.json'))))
+            Write-Output ('DIAG 5.0f in-suite serialization of the same fresh inventory: ' + (ConvertTo-Json -InputObject @{ FileHashes = $diagFresh; BundleHash = 'X' } -Depth 8))
             $seqResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable)
             Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2}, Reason {3})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result, [string]$seqResult.Reason)
             $seqStateRaw = [System.IO.File]::ReadAllText($seqStatePath)
