@@ -2720,8 +2720,11 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
             }
             Test-Path -LiteralPath $marker | Should -BeTrue
             Start-Sleep -Seconds 2
-            try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch { }
-            try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
+            # No Stop-Job AND no Remove-Job: the child PROCESS is dead
+            # (SIGKILL, marker at ~2s), but both teardown cmdlets block ~58s
+            # waiting on the dead child's pipe (measured on this host: the
+            # call returned at ~62s). The dead job entry is reaped at process
+            # exit and holds nothing the suite reads.
             # The crashed checkpoint, read back from the FILE only: everything
             # before the crash completed, the in-flight attempt is recorded,
             # and the pre-delegation reboot marker is durable.

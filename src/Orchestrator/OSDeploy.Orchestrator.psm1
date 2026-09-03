@@ -3297,7 +3297,10 @@ function Invoke-DeploymentSequence {
         NOT Blocked; LogFinalization only when the current run log verifies
         (SummaryMayClose); both are phase failures into the attempt engine
         otherwise - routed to the blocking Technician Review, never
-        skipped.
+        skipped. KNOWN LIMITATION: the default WindowsUpdate action
+        discards CyclesCompleted - when a mid-cycles reboot is signaled, the
+        remaining update cycles (and the warn-and-acknowledge surface)
+        require host wiring via -PhaseRunners to drive.
 
         COMPLETION: after the Cleanup phase's action, the conductor calls
         Complete-Deployment -Handoff 'Completed' -RequiredPhases <every
