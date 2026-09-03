@@ -92,5 +92,5 @@ Phases 0–2 per `design.md` (Migration Plan, D12). Each task names the capabili
 
 ## 11. Component verification on Windows VM (`repo-standards`, all capabilities)
 
-- [ ] 11.1 Windows VM component suite: orchestrator engine and phases against the mock partition fixture, including Scheduled Task registration, integrity revalidation, GUI screens, and phase handoffs
+- [x] 11.1 Windows VM component suite: orchestrator engine and phases against the mock partition fixture, including Scheduled Task registration, integrity revalidation, GUI screens, and phase handoffs
 - [x] 11.2 Full run: static gates and all Pester suites green on the Linux dev box; record versions and results for `verify.md`

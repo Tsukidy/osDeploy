@@ -1,0 +1,125 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260903124359
+Username: runnervmeef0v\runneradmin
+RunAs User: runnervmeef0v\runneradmin
+Configuration Name: 
+Machine: runnervmeef0v (Microsoft Windows NT 10.0.26100.0)
+Host Application: powershell -NoProfile -ExecutionPolicy Bypass -File tests/component/ComponentSuite.ps1
+Process ID: 6468
+PSVersion: 5.1.26100.33296
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.33296
+BuildVersion: 10.0.26100.33296
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+
+Check 1: Set-OrchestratorAcl NTFS restriction
+PASS 1: 1.1 Set-OrchestratorAcl returns Ok = True
+PASS 2: 1.2 inheritance is disabled on the directory (AreAccessRulesProtected)
+PASS 3: 1.3 exactly two access rules exist (found 2)
+PASS 4: 1.4a the ACL carries NT AUTHORITY\SYSTEM (S-1-5-18)
+PASS 5: 1.4b the ACL carries BUILTIN\Administrators (S-1-5-32-544)
+PASS 6: 1.5 every rule is an Allow FullControl rule
+
+Check 2: Register-OrchestratorTask SYSTEM startup registration
+PASS 7: 2.1 Register-OrchestratorTask returns Ok = True
+PASS 8: 2.2 Get-ScheduledTask finds the registered task
+PASS 9: 2.3 the principal is SYSTEM (found SYSTEM)
+PASS 10: 2.4 the logon type is ServiceAccount: no sign-in required, no stored password (found ServiceAccount)
+PASS 11: 2.5 the run level is Highest (found Highest)
+PASS 12: 2.6 the multiple-instance policy is IgnoreNew (found IgnoreNew)
+PASS 13: 2.7 a startup (boot) trigger is present
+PASS 14: 2.8a the registration marker TaskRegistration.json is written
+PASS 15: 2.8b the marker TaskName matches
+PASS 16: 2.8c the marker RegisteredUtc is present
+
+Check 3: Unregister-OrchestratorTask idempotent removal
+PASS 17: 3.1 the first Unregister call reports Ok = True with Existed = True
+PASS 18: 3.2 Get-ScheduledTask no longer finds the task
+PASS 19: 3.3 the second Unregister call is a successful no-op (safe to call twice)
+PASS 20: 3.4 the registration marker is untouched by Unregister (Invoke-Cleanup owns marker removal)
+
+Check 4: orchestrator launch under the task acquires the mutex
+PASS 21: 4.1 the probe task registers Ok = True
+PASS 22: 4.2 the task launched and the probe completed within the timeout
+PASS 23: 4.3 Enter-Orchestrator under the task acquired the single-instance mutex (outcome: Ran=True)
+PASS 24: 4.4 the probe task left the Running state (its process exit released the single-instance mutex before the in-process checks)
+PASS 25: 4.5 the probe task is retired
+NOTE 4.6 this check proves the Q35 abandoned-mutex recovery: a grandchild acquires Global\OSDeploy.Orchestrator and dies without releasing while a probe holds the kernel object open (true abandonment); the probe Enter-Orchestrator must still acquire.
+PASS 26: 4.6 the grandchild acquired Global\OSDeploy.Orchestrator through Enter-Orchestrator and died holding it (outcome: Ran=True)
+PASS 27: 4.7 Enter-Orchestrator recovered from the abandoned mutex and acquired it (probe exit 0, outcome: ProbeRan=True)
+
+Check 5: Invoke-DeploymentSequence full run against a fresh mock partition
+NOTE 5.0 PhaseRunners injections for determinism on this VM: Drivers and Applications (real engines, stubbed host executors), WindowsUpdate (real cycle engine, clean-report scanner), FinalValidation (real validator, empty rescan), BootEntryRegistration (real wrapper incl. BootOverride clearing, contract-valid BootTool report). Real default bodies ran for WorkflowSpecifics (EZT recorder), Activation, LogFinalization, Cleanup, and Complete-Deployment, and the REAL entry gates ran: config-provenance event and the Q90 integrity recheck over the staged orchestrator home (RebootPending is clear at first entry, so the identity gate is not in play here).
+PASS 28: 5.0a the real task registration (suite-unique name) returns Ok before the sequence runs
+PASS 29: 5.0b the completion footprint (marker, runtime directory, boot override) is staged before the sequence runs
+PASS 30: 5.0c the fixture integrity record validates clean before the sequence (mismatches: )
+PASS 31: 5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome Completed, Completed True, Result Completed, Reason )
+PASS 32: 5.2 the completed DeploymentState.json passes Test-DeploymentState (errors: )
+PASS 33: 5.3a CompletedUtc is recorded as an ISO 8601 UTC string
+PASS 34: 5.3b no stale BlockedBy record remains on the completed document
+PASS 35: 5.4 CompletedPhases records the full nine-phase sequence in order (found Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup)
+PASS 36: 5.5 RebootPending is clear on the completed checkpoint
+PASS 37: 5.6a scoped cleanup removed the TaskRegistration.json marker
+PASS 38: 5.6b boot-entry registration success cleared the one-time BootOverride.json marker
+PASS 39: 5.6c scoped cleanup removed the OrchestratorRuntime directory
+PASS 40: 5.7 recovery content is retained through cleanup (missing: )
+PASS 41: 5.8 the verified run log survives cleanup and still re-parses as valid JSONL
+PASS 42: 5.9 cleanup retired the SCHEDULED TASK ITSELF as well as the marker (Q89: cleanup removes the task; Invoke-Cleanup unregisters by the marker task name)
+PASS 43: 5.10 the entry gates logged the config provenance and integrity validation events into the run own log (Q84/Q90)
+
+Check 6: integrity record, tamper detection, local-only repair (Q90/Q92)
+PASS 44: 6.1 New-IntegrityRecord inventories both staged orchestrator files and writes the record
+PASS 45: 6.2 Test-Integrity passes against the in-memory record
+PASS 46: 6.3 Test-Integrity passes against the record read back from IntegrityRecord.json (the post-restart shape)
+PASS 47: 6.4 a flipped byte in Part1.psm1 fails the recheck with a Changed mismatch
+PASS 48: 6.5 a deleted Part2.psm1 fails the recheck with a Missing mismatch
+PASS 49: 6.6 Repair-FromLocalSource recopies from the LOCAL partition repair source and reports Repaired = True
+PASS 50: 6.7 the repaired directory revalidates against the SAME record
+PASS 51: 6.8 a missing repair source stops at the blocking Technician Review (no Ignore/Continue path) and leaves the directory untouched (tampered file hash unchanged)
+PASS 52: 6.9 the still-tampered directory continues to fail the recheck after the refused repair
+
+Check 7: GUI screens render in an STA runspace (OSDeploy.Gui)
+PASS 53: 7.1 the host thread is STA (Assert-STA passes before any WPF type is touched):
+PASS 54: 7.2 the WPF assemblies load on this Windows host:
+PASS 55: 7.3 Get-Screen loads AcknowledgeContinue.xaml through the Gui module loader:
+PASS 56: 7.4 AcknowledgeContinue instantiates a WPF Window titled Acknowledge and Continue:
+PASS 57: 7.5 AcknowledgeContinue named elements resolve in the instantiated window (missing: )
+PASS 58: 7.6 Get-Screen loads NotedIssuesSummary.xaml through the Gui module loader:
+PASS 59: 7.7 NotedIssuesSummary instantiates a WPF Window titled Noted Issues Summary:
+PASS 60: 7.8 NotedIssuesSummary named elements resolve in the instantiated window (missing: )
+PASS 61: 7.9 Get-Screen loads TechnicianReview.xaml through the Gui module loader:
+PASS 62: 7.10 TechnicianReview instantiates a WPF Window titled Technician Review:
+PASS 63: 7.11 TechnicianReview named elements resolve in the instantiated window (missing: )
+PASS 64: 7.12 the wizard host walks the three real screens forward to the last screen
+PASS 65: 7.13 the wizard host walks back to the first screen without passing it
+
+Check 8: phase handoffs write contract-valid state
+NOTE 8.0 PhaseRunners injections in this group: the Check 5 determinism table wherever phases still run; the 8.3 scenario injects Drivers with a restart-request action; the 8.5 re-entry injects the IDENTITY PROVIDER with the mock partition staged identity (the real provider reports this VM actual identity, which never matches the mock GUIDs); the 8.8 scenario deliberately leaves BootEntryRegistration on its DEFAULT wiring so the REAL bcdedit-based boot check runs and fails closed.
+PASS 66: 8.0 the single-instance lock is held by this process after the Check 5 entry (the second-instance handoff needs it)
+PASS 67: 8.1 a second in-process launch returns SecondInstance without phase work (found Outcome SecondInstance)
+PASS 68: 8.2 the second instance mutated no state file (DeploymentState.json hash unchanged)
+PASS 69: 8.3 a restart-requesting Drivers phase returns RebootPending (found Outcome RebootPending, Phase Drivers, Reason )
+PASS 70: 8.4 the pre-reboot checkpoint is contract-valid: Drivers completed, RebootPending durable
+PS>TerminatingError(Get-Item): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Cannot find path 'C:\OSDeploy-ComponentSuite-b44064ff28f64b3ebf329d03c3be452b\HandoffPartition\State\TaskRegistration.json' because it does not exist."
+PASS 71: 8.5 the post-reboot re-entry completes the sequence (found Outcome Completed, Reason )
+PASS 72: 8.6 the resumed checkpoint records the full sequence exactly once per phase (Drivers appears 1 time(s))
+PASS 73: 8.7 the resumed completion records CompletedUtc
+PASS 74: 8.8 the real bcdedit boot check fails closed into the blocking Technician Review (found Outcome TechnicianReview, Phase BootEntryRegistration)
+PASS 75: 8.9 the review checkpoint is contract-valid with exactly the six phases before the block completed (found Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation)
+PASS 76: 8.10 three automatic attempts exhausted, the fourth failure recorded for the person (Attempt 4)
+PASS 77: 8.11 the blocked run records no Result and no CompletedUtc
+PASS 78: 8.12 the sequence stopped BEFORE completion work: the marker and runtime directory survive untouched
+PASS 79: 8.13 the post-completion re-entry returns PostCompletionRestart with Ok True (found Outcome PostCompletionRestart, Ok True)
+PASS 80: 8.14 the cleanup-only re-entry removed the re-staged marker and runtime directory
+PASS 81: 8.15 the cleanup-only re-entry rewrote no state field (DeploymentState.json hash unchanged)
+
+COMPONENT SUITE PASS: 81 checks
+**********************
+Windows PowerShell transcript end
+End time: 20260903124421
+**********************

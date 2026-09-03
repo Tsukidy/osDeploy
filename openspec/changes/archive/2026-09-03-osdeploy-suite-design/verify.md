@@ -116,3 +116,16 @@ unexecuted manual verification of the same character:
 **Next step**: produce the retrospective, then `openspec archive -y`, then
 `superpowers:finishing-a-development-branch` with the complete archived cycle
 in the PR diff.
+
+---
+
+> **Update 2026-09-03 (post-archive)**: task 11.1 is now COMPLETE. The
+> component suite ran on a real Windows PowerShell 5.1 host (elevated
+> `windows-latest` GitHub Actions runner) and passed all 81 checks —
+> run 33756872501, evidence committed at `tests/component/last-run.log`
+> (commit range `1361699..4a80ead` carried the two 5.1-only fixes the
+> first execution surfaced: the suite's missing OSDeploy.Logging import
+> and the fixture builder's PSObject-wrapped inventory serialization;
+> plus a strict-mode null-safe getter). The Overall Decision warning (1)
+> above is resolved; the retrospective's findings stand as written at
+> cycle end per the forward-pointer policy.
