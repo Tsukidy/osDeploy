@@ -544,7 +544,7 @@ catch {
             $preFlight = Test-Integrity -Directory $runtimeDir -Record $preFlightRecord
             Assert-True ([bool]$preFlight.Ok) ('5.0c the fixture integrity record validates clean before the sequence (mismatches: {0})' -f ((@($preFlight.Mismatches) | ForEach-Object { '{0}:{1}' -f [string](Get-SuiteJsonField -Record $_ -Name 'Path'), [string](Get-SuiteJsonField -Record $_ -Name 'Reason') }) -join ' | '))
             $seqResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable)
-            Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2}, Reason {3})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result, [string]$seqResult.Reason)
+            Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2}, Reason {3})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result, [string](Get-SuiteJsonField -Record $seqResult -Name 'Reason'))
             $seqStateRaw = [System.IO.File]::ReadAllText($seqStatePath)
             $seqValidation = Test-DeploymentState -Record (Read-JsonFile -Path $seqStatePath)
             Assert-True ([bool]$seqValidation.Valid) ('5.2 the completed DeploymentState.json passes Test-DeploymentState (errors: {0})' -f (($seqValidation.Errors) -join '; '))
@@ -747,7 +747,7 @@ catch {
                 return $true
             }
             $rebootResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners $rebootTable
-            Assert-True ($rebootResult.Outcome -eq 'RebootPending' -and [string]$rebootResult.Phase -eq 'Drivers' -and -not [bool]$rebootResult.Completed) ('8.3 a restart-requesting Drivers phase returns RebootPending (found Outcome {0}, Phase {1}, Reason {2})' -f [string]$rebootResult.Outcome, [string]$rebootResult.Phase, [string]$rebootResult.Reason)
+            Assert-True ($rebootResult.Outcome -eq 'RebootPending' -and [string]$rebootResult.Phase -eq 'Drivers' -and -not [bool]$rebootResult.Completed) ('8.3 a restart-requesting Drivers phase returns RebootPending (found Outcome {0}, Phase {1}, Reason {2})' -f [string]$rebootResult.Outcome, [string]$rebootResult.Phase, [string](Get-SuiteJsonField -Record $rebootResult -Name 'Reason'))
             $rebootResume = Get-ResumePoint -Path $handoffStatePath
             $rebootValidation = Test-DeploymentState -Record (Read-JsonFile -Path $handoffStatePath)
             Assert-True ((@($rebootResume.CompletedPhases) -join ',') -eq 'Drivers' -and [bool]$rebootResume.RebootPending -and [bool]$rebootValidation.Valid) '8.4 the pre-reboot checkpoint is contract-valid: Drivers completed, RebootPending durable'
@@ -769,7 +769,7 @@ catch {
                 }
             }
             $resumeResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable) -IdentityProvider $stagedIdentityProvider
-            Assert-True ($resumeResult.Outcome -eq 'Completed' -and [string]$resumeResult.Result -eq 'Completed') ('8.5 the post-reboot re-entry completes the sequence (found Outcome {0}, Reason {1})' -f [string]$resumeResult.Outcome, [string]$resumeResult.Reason)
+            Assert-True ($resumeResult.Outcome -eq 'Completed' -and [string]$resumeResult.Result -eq 'Completed') ('8.5 the post-reboot re-entry completes the sequence (found Outcome {0}, Reason {1})' -f [string]$resumeResult.Outcome, [string](Get-SuiteJsonField -Record $resumeResult -Name 'Reason'))
             $finalResume = Get-ResumePoint -Path $handoffStatePath
             $driversCount = @($finalResume.CompletedPhases | Where-Object { $_ -eq 'Drivers' }).Count
             Assert-True ((@($finalResume.CompletedPhases) -join ',') -eq $expectedPhases -and $driversCount -eq 1) ('8.6 the resumed checkpoint records the full sequence exactly once per phase (Drivers appears {0} time(s))' -f $driversCount)
