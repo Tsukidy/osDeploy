@@ -2555,3 +2555,473 @@ function Invoke-UpdatePhase {
         CyclesCompleted      = $MaxCycles
     }
 }
+
+# ---------------------------------------------------------------------------
+# Final validation, result states, boot-entry registration, log finalization,
+# and the phase sequence constant (Q28/Q29, Q67-Q73, Q94 orchestrator portion)
+# ---------------------------------------------------------------------------
+
+# The full orchestrator phase sequence, exact order. This is the wiring
+# constant the resume engine walks (the phase-sequence integration task and
+# the host wiring consume it through Get-PhaseOrder; Invoke-Phase checkpoints
+# each entry into CompletedPhases as it completes). Exposed as a getter so a
+# foreign scriptblock cannot reach into module scope to read it, and so the
+# sequence can never be mutated through a leaked reference.
+$script:PhaseOrder = @(
+    'Drivers',
+    'Applications',
+    'WorkflowSpecifics',
+    'WindowsUpdate',
+    'Activation',
+    'FinalValidation',
+    'BootEntryRegistration',
+    'LogFinalization',
+    'Cleanup'
+)
+
+function Get-PhaseOrder {
+    <#
+        .SYNOPSIS
+        Returns the exact nine-phase orchestrator sequence (PHASE_ORDER).
+
+        .DESCRIPTION
+        Drivers, Applications, WorkflowSpecifics, WindowsUpdate, Activation,
+        FinalValidation, BootEntryRegistration, LogFinalization, Cleanup - in
+        exactly that order. The constant lives at module scope; this getter
+        hands back a FRESH cloned array per call (the module convention), so
+        no caller can mutate the sequence another caller reads. The resume
+        engine and the host wiring treat this list as the authority for phase
+        ordering and for the required-phase set handed to
+        Complete-Deployment's -RequiredPhases gate.
+    #>
+    [CmdletBinding()]
+    param()
+    # Clone: a new array instance every call, identical content.
+    return ([object[]]$script:PhaseOrder).Clone()
+}
+
+# The Q28 problem-device vocabulary. A device is healthy ONLY when its Status
+# is 'Ok' (case-insensitive); every other value - including an absent, null,
+# or unrecognized Status - fails closed as a problem device, canonicalized to
+# the matching vocabulary token or to 'Unknown' when nothing matches.
+$script:PnpProblemStatuses = @('Unknown', 'Missing', 'Incompatible', 'ProblemCode', 'Unhealthy')
+
+function Invoke-PnpValidation {
+    <#
+        .SYNOPSIS
+        Q28 final validation: classify the PnP rescan and produce exactly ONE
+        acknowledged warning listing every problem device.
+
+        .DESCRIPTION
+        -Devices is the PnP rescan result handed to the validator: an array
+        of device records shaped like Get-PnpDevice output, each carrying at
+        least Id, FriendlyName, and a Status problem indicator. DESIGN CHOICE
+        (documented): the problem indicator is a 'Status' field whose
+        vocabulary is 'Unknown', 'Missing', 'Incompatible', 'ProblemCode',
+        and 'Unhealthy'; the ONLY healthy value is 'Ok' (case-insensitive).
+        An absent, null, empty, or unrecognized Status fails CLOSED as a
+        problem device canonicalized to 'Unknown' - a device whose state
+        cannot be established positively is never silently passed (the same
+        rule identity validation applies). Hashtable and PSCustomObject
+        records are both accepted. The engine does no hardware I/O itself:
+        the rescan is the consumer's PnP query, classification is pure.
+
+        ONE WARNING, NEVER N: however many problem devices exist, the result
+        carries a SINGLE warning object listing them all - Q28's warning is
+        one acknowledged warning, never a warning per device. The warning
+        shape is @{ Code = 'PnpDeviceIssues'; Message; Devices } where
+        Message names every problem device ('<FriendlyName> (<Status>)'
+        joined with '; ') and Devices is the per-device finding list.
+
+        Returns @{ Ok; Warning; Findings }:
+        - Ok = $true only when no problem device exists;
+        - Warning = the single warning object, or $null when Ok;
+        - Findings = the per-device @{ Id; FriendlyName; Status } list
+          RETAINED for the summary (the consumer presents these as the
+          noted issues even after the warning is acknowledged). Findings are
+          in input order and are fresh objects per call.
+        Empty or absent device input is not a warning: Ok = $true with a
+        null Warning and an empty Findings array.
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]]$Devices = @()
+    )
+    $findings = @()
+    foreach ($device in @($Devices)) {
+        $token = ''
+        if ($null -ne $device) {
+            $status = Get-OrchestratorField -Record $device -Name 'Status'
+            if ($null -ne $status) { $token = ([string]$status).Trim() }
+        }
+        if ($token -ieq 'Ok') { continue }
+        # Fail closed: anything not explicitly 'Ok' is a problem device. A
+        # token matching the vocabulary case-insensitively canonicalizes to
+        # it; every other shape (absent, empty, unrecognized) becomes
+        # 'Unknown'.
+        $canonical = 'Unknown'
+        foreach ($problem in $script:PnpProblemStatuses) {
+            if ($token -ieq $problem) { $canonical = $problem }
+        }
+        $id = ''
+        $name = ''
+        if ($null -ne $device) {
+            $id = [string](Get-OrchestratorField -Record $device -Name 'Id')
+            $name = [string](Get-OrchestratorField -Record $device -Name 'FriendlyName')
+        }
+        $findings += @{ Id = $id; FriendlyName = $name; Status = $canonical }
+    }
+    if (@($findings).Count -eq 0) {
+        return @{ Ok = $true; Warning = $null; Findings = @() }
+    }
+    $parts = @()
+    foreach ($finding in @($findings)) {
+        $parts += ('{0} ({1})' -f $finding.FriendlyName, $finding.Status)
+    }
+    $warning = @{
+        Code    = 'PnpDeviceIssues'
+        Message = ('Final device validation found {0} device(s) with problems: {1}.' -f @($findings).Count, ($parts -join '; '))
+        Devices = @($findings)
+    }
+    return @{ Ok = $false; Warning = $warning; Findings = @($findings) }
+}
+
+function Get-TechnicianReviewOptions {
+    <#
+        .SYNOPSIS
+        Returns the Q29 Technician Review options for a failed validation.
+
+        .DESCRIPTION
+        Exactly three options, exact order, Q29 verbatim: 'Manual
+        Remediation', 'Rescan Devices', 'Rerun Validation'. The consumer
+        presents these when a validation failure or retryable condition
+        routes to the blocking Technician Review; this function is the pure
+        option list (no state, no I/O). A FRESH array is returned per call
+        (the module convention).
+    #>
+    [CmdletBinding()]
+    param()
+    return @('Manual Remediation', 'Rescan Devices', 'Rerun Validation')
+}
+
+function Resolve-ResultState {
+    <#
+        .SYNOPSIS
+        Q67-Q72 result-state resolution: the run's finish label from its
+        warnings, their acknowledgement, and the finish submission.
+
+        .DESCRIPTION
+        The complete vocabulary is exactly three states - 'Completed',
+        'Completed with Warnings', 'Completed with Tech-Addressed Warnings' -
+        and NOTHING ELSE: there is deliberately no state that asserts the
+        machine is fit to hand off; hand-off fitness is never recorded as a
+        run state (Q67-Q72).
+
+        Truth table:
+        - No warnings -> 'Completed' (regardless of the other inputs).
+        - Warnings AND Acknowledged = $true AND FinishSubmitted = $true ->
+          'Completed with Tech-Addressed Warnings' (the technician
+          acknowledged the warning list AND the finish was submitted; both
+          are required).
+        - ANY other warning row (Acknowledged $null = not yet asked,
+          Acknowledged $false, or finish submitted without acknowledgement)
+          -> 'Completed with Warnings'. Acknowledged-but-not-finished is
+          deliberately provisional: the acknowledgement only takes effect
+          when the finish lands, so the state reads 'Completed with
+          Warnings' until the consumer calls this at finish time with
+          FinishSubmitted = $true.
+
+        -Warnings is any warning list (Invoke-PnpValidation's single warning
+        object, the update phase's leftover warning, ...); a null, absent,
+        or all-null list is 'no warnings' (binding $null to the array
+        parameter yields a one-element null array - PowerShell binding, not
+        a warning - so null entries are filtered before counting).
+        -Acknowledged is three-state: $null = the acknowledgement was never
+        asked for.
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]]$Warnings = @(),
+        [Nullable[bool]]$Acknowledged,
+        [bool]$FinishSubmitted = $false
+    )
+    $present = @()
+    foreach ($entry in @($Warnings)) {
+        if ($null -ne $entry) { $present += $entry }
+    }
+    if (@($present).Count -eq 0) { return 'Completed' }
+    if ($Acknowledged -eq $true -and $FinishSubmitted) {
+        return 'Completed with Tech-Addressed Warnings'
+    }
+    return 'Completed with Warnings'
+}
+
+# Internal: locate the boot path line of the BCD entry whose identifier line
+# matches -Identifier, within the raw bcdedit enumeration lines. Returns the
+# path value ('' when the entry or its path line is not found).
+function Get-BcdEntryPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]
+        [string[]]$Lines,
+        [Parameter(Mandatory)][string]$Identifier
+    )
+    $inEntry = $false
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*identifier\s+(.+)$') {
+            if ($inEntry) { break }
+            if ($Matches[1].Trim() -eq $Identifier) { $inEntry = $true }
+            continue
+        }
+        if ($inEntry -and $line -match '^\s*path\s+(.+)$') {
+            return $Matches[1].Trim()
+        }
+    }
+    return ''
+}
+
+# Internal: the REAL deploy-host boot check behind the default BootTool.
+# Deploy-host-only: reads the BCD through bcdedit.exe (READ-ONLY /enum; the
+# engine never mutates the store here) and projects the Q94 report contract.
+# The bcdedit parsing below is best-effort and - like the WUA COM body in
+# Invoke-ScopedUpdatePass - belongs to the host wiring's live validation
+# pass; the REPORT CONTRACT and the registration logic above it are what the
+# suite locks through the injected -BootTool seam.
+#
+# Fail-visible contract: ANY failure - including bcdedit.exe being absent on
+# a non-Windows host - returns the all-false report so the caller fails
+# closed (Blocked). This function never throws and never invents a pass.
+function Invoke-RealBootEntryCheck {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context
+    )
+    $report = @{
+        EntryPresent       = $false
+        TimeoutSeconds     = 0
+        WindowsDefault     = $false
+        PartitionIdentityOk = $false
+        BootFilesOk        = $false
+    }
+    try {
+        # String interpolation, not Join-Path: the deploy-host path is
+        # drive-qualified and Join-Path rejects an absent drive when the
+        # suite stages $env:SystemRoot on a non-Windows platform.
+        $bcdedit = "$env:SystemRoot\System32\bcdedit.exe"
+        if (-not (Test-Path -LiteralPath $bcdedit)) { return $report }
+        $lines = [string[]](@(& $bcdedit /enum all) | ForEach-Object { [string]$_ })
+
+        # Entry presence: the persistent Factory Recovery entry's
+        # description (the entry description string the host wiring
+        # registers; matched case-insensitively).
+        $recoveryIdentifier = ''
+        $lastIdentifier = ''
+        $recoveryDevice = ''
+        $recoveryPath = ''
+        foreach ($line in $lines) {
+            if ($line -match '^\s*identifier\s+(.+)$') {
+                $lastIdentifier = $Matches[1].Trim()
+                continue
+            }
+            if ($line -match '^\s*description\s+(.+)$') {
+                if ($Matches[1] -imatch 'OSDeploy Factory Recovery') {
+                    $recoveryIdentifier = $lastIdentifier
+                }
+                continue
+            }
+            if ($recoveryIdentifier -ne '' -and $lastIdentifier -eq $recoveryIdentifier) {
+                if ($recoveryDevice -eq '' -and $line -match '^\s*device\s+partition=(.+)$') {
+                    $recoveryDevice = $Matches[1].Trim()
+                }
+                elseif ($recoveryPath -eq '' -and $line -match '^\s*path\s+(.+)$') {
+                    $recoveryPath = $Matches[1].Trim()
+                }
+            }
+        }
+        if ($recoveryIdentifier -eq '') { return $report }
+        $report.EntryPresent = $true
+
+        # Boot manager defaults: the {bootmgr} section's timeout and default.
+        $timeoutSeconds = 0
+        $defaultTarget = ''
+        $inBootMgr = $false
+        foreach ($line in $lines) {
+            if ($line -match '^\s*identifier\s+\{bootmgr\}') { $inBootMgr = $true; continue }
+            if ($line -match '^\s*identifier\s+' -and $inBootMgr) { $inBootMgr = $false; continue }
+            if (-not $inBootMgr) { continue }
+            if ($line -match '^\s*timeout\s+(\d+)') { $timeoutSeconds = [int]$Matches[1] }
+            if ($defaultTarget -eq '' -and $line -match '^\s*default\s+(.+)$') { $defaultTarget = $Matches[1].Trim() }
+        }
+        $report.TimeoutSeconds = $timeoutSeconds
+        # Windows is the default when the boot manager's default entry is
+        # the Windows loader (winload), not the recovery entry.
+        if ($defaultTarget -ne '' -and $defaultTarget -ne $recoveryIdentifier) {
+            $defaultPath = Get-BcdEntryPath -Lines $lines -Identifier $defaultTarget
+            if ($defaultPath -match '(?i)winload\.(efi|exe)') { $report.WindowsDefault = $true }
+        }
+
+        # Partition identity: the recovery entry boots from the partition
+        # the orchestrator is running from (the PartitionRoot's drive).
+        $root = [string](Get-OrchestratorField -Record $Context -Name 'PartitionRoot')
+        if ($recoveryDevice -ne '' -and $root -ne '') {
+            $rootDrive = ([System.IO.Path]::GetPathRoot($root.TrimEnd('\')) + '\')
+            if ($rootDrive -ne '\' -and $recoveryDevice.TrimEnd('\') -ieq $rootDrive.TrimEnd('\')) {
+                $report.PartitionIdentityOk = $true
+            }
+        }
+        else {
+            # No partition root in the context and no device to compare is
+            # not a validated identity - fail closed.
+            $report.PartitionIdentityOk = $false
+        }
+
+        # Boot files: the recovery entry's declared path exists on its
+        # declared device partition.
+        if ($report.PartitionIdentityOk -and $recoveryPath -ne '') {
+            $bootFile = Join-Path ($recoveryDevice.TrimEnd('\') + '\') $recoveryPath.TrimStart('\')
+            if (Test-Path -LiteralPath $bootFile) { $report.BootFilesOk = $true }
+        }
+        return $report
+    }
+    catch {
+        return $report
+    }
+}
+
+function Invoke-BootEntryRegistration {
+    <#
+        .SYNOPSIS
+        Q94 orchestrator portion: register and validate the persistent
+        Factory Recovery boot entry, clear the deployment-only override, and
+        block completion on any failure.
+
+        .DESCRIPTION
+        BOOT TOOL CONTRACT (the injectable seam): -BootTool is invoked ONCE
+        with a context object @{ PartitionRoot = <string or ''> } and returns
+        a report carrying at least five fields (hashtable or PSCustomObject):
+        EntryPresent [bool] (the persistent Factory Recovery entry exists),
+        TimeoutSeconds (the boot-manager timeout; the Q94 contract is FIVE
+        seconds), WindowsDefault [bool] (Windows is the default entry, not
+        the recovery entry), PartitionIdentityOk [bool] (the entry's
+        partition identity matches the orchestrator's partition), and
+        BootFilesOk [bool] (the entry's boot files validate). The tool
+        READS/CHECKS the boot configuration; registration itself is the
+        deploy host's boot step this phase wraps.
+
+        Outcomes (exactly three keys):
+        - Registered = $true only when EntryPresent AND TimeoutSeconds = 5
+          AND WindowsDefault - the Q94 persistent-entry contract.
+        - Validated = $true only when PartitionIdentityOk AND BootFilesOk.
+        - Blocked = $true on ANY failure: an unregistered outcome, a failed
+          validation, a throwing tool, a malformed or missing report field
+          (fail closed - nothing is ever inferred from an absent field), or
+          a failure to clear the override marker. Complete-Deployment treats
+          Blocked as a completion blocker through its -RequiredPhases gate:
+          the sequence engine records the BootEntryRegistration phase
+          complete only when this returns Blocked = $false, so a blocked
+          registration surfaces as RequiredWorkIncomplete.
+
+        SUCCESS ALSO CLEARS the deployment-only boot override (Q94): when
+        registered, validated, and not blocked, the one-time override marker
+        <PartitionRoot>\State\BootOverride.json is DELETED (the persistent
+        Factory Recovery entry now governs; the deployment-only override is
+        spent). An absent marker is a no-op success. A DIRECTORY squatting
+        on the marker path is reported as Blocked rather than blindly
+        deleted (the Invoke-Cleanup convention). With -PartitionRoot
+        unbound there is no marker location to clear.
+
+        Default BootTool (when -BootTool is omitted): delegates to the
+        internal Invoke-RealBootEntryCheck - the REAL bcdedit-based check
+        (deploy-host-only, read-only, fail-visible; see its doc comment).
+    #>
+    [CmdletBinding()]
+    param(
+        [scriptblock]$BootTool,
+        [string]$PartitionRoot = ''
+    )
+    $tool = $BootTool
+    if ($null -eq $tool) {
+        $tool = { param($Context) return (Invoke-RealBootEntryCheck -Context $Context) }
+    }
+    $registered = $false
+    $validated = $false
+    $report = $null
+    $toolFailed = $false
+    try { $report = & $tool @{ PartitionRoot = $PartitionRoot } }
+    catch { $toolFailed = $true }
+    if (-not $toolFailed -and $null -ne $report) {
+        $entryPresent = [bool](Get-OrchestratorField -Record $report -Name 'EntryPresent')
+        $windowsDefault = [bool](Get-OrchestratorField -Record $report -Name 'WindowsDefault')
+        # A missing or non-numeric TimeoutSeconds can never satisfy the
+        # five-second contract: fail closed instead of throwing.
+        $timeoutOk = $false
+        $timeoutField = Get-OrchestratorField -Record $report -Name 'TimeoutSeconds'
+        if ($null -ne $timeoutField) {
+            try { if ([int]$timeoutField -eq 5) { $timeoutOk = $true } }
+            catch { $timeoutOk = $false }
+        }
+        $registered = $entryPresent -and $timeoutOk -and $windowsDefault
+        $identityOk = [bool](Get-OrchestratorField -Record $report -Name 'PartitionIdentityOk')
+        $bootFilesOk = [bool](Get-OrchestratorField -Record $report -Name 'BootFilesOk')
+        $validated = $identityOk -and $bootFilesOk
+    }
+    $blocked = -not ($registered -and $validated)
+    if (-not $blocked -and $PartitionRoot -ne '') {
+        # Success clears the deployment-only override (Q94): delete the
+        # one-time marker. Unknown directory content squatting on the marker
+        # path is never blindly deleted.
+        $markerPath = Join-Path $PartitionRoot 'State\BootOverride.json'
+        if (Test-Path -LiteralPath $markerPath) {
+            $markerItem = Get-Item -LiteralPath $markerPath -Force
+            if ($markerItem.PSIsContainer) {
+                $blocked = $true
+            }
+            else {
+                try { Remove-Item -LiteralPath $markerPath -Force -ErrorAction Stop }
+                catch { $blocked = $true }
+            }
+        }
+    }
+    return @{ Registered = $registered; Validated = $validated; Blocked = $blocked }
+}
+
+function Invoke-LogFinalization {
+    <#
+        .SYNOPSIS
+        Q73 summary gate: the run summary may close only after the log
+        verifies.
+
+        .DESCRIPTION
+        Gates on Complete-RunLog -Log $Log (the JSONL re-read gate from the
+        Logging module): every events line must re-parse as JSON before the
+        summary is trustworthy. Returns @{ SummaryMayClose; Verified } -
+        the design choice per the contract: the state field is RETURNED
+        rather than held in module scope, so every caller (and every retry)
+        reads the CURRENT verification. SummaryMayClose stays $false until
+        the log verifies; a retry after the log is repaired re-verifies and
+        returns $true. Verified mirrors the raw gate result so consumers can
+        distinguish 'checked and failed' from unchecked states if they ever
+        need to.
+
+        Failure contract: a missing events file, a corrupt line, or a
+        malformed log object (no EventsPath - Complete-RunLog's strict-mode
+        property access throws) is a verification FAILURE, never an
+        exception past this gate. The consumer runs this BEFORE cleanup
+        destroys anything else and blocks completion on SummaryMayClose =
+        $false (the Q73 order: the summary gate closes before cleanup runs).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Log
+    )
+    $verified = $false
+    try {
+        $verified = [bool](Complete-RunLog -Log $Log)
+    }
+    catch {
+        # A malformed log object is a verification failure, never a thrown
+        # exception past the summary gate.
+        $verified = $false
+    }
+    return @{ SummaryMayClose = $verified; Verified = $verified }
+}

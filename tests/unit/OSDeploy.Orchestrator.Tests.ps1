@@ -2114,3 +2114,369 @@ Describe 'Invoke-UpdatePhase scoped cycles, acknowledgement, and offline skip (Q
         { Invoke-UpdatePhase -MaxCycles 2 -ResumeContext -1 -Scanner { param($Context) } } | Should -Throw
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 26: final validation, result states, boot-entry registration, and log
+# finalization (Q28/Q29, Q67-Q73, Q94 orchestrator portion). None of these
+# tests needs the single-instance lock or an orchestration context. Device
+# inputs are plain records (hashtables or PSCustomObjects - the documented
+# Get-PnpDevice-shaped input); every boot-entry scenario drives an injected
+# BootTool scriptblock (the documented seam), and the default-tool tests Mock
+# the module-internal real check (Invoke-RealBootEntryCheck) the way Task 25
+# mocks Invoke-ScopedUpdatePass. The Q94 deployment-only override marker is
+# staged as <root>\State\BootOverride.json.
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-PnpValidation one-warning final device validation (Q28)' {
+    It 'multi-problem devices produce exactly ONE warning object listing every problem device' {
+        $devices = @(
+            @{ Id = 'PCI\VEN_8086&DEV_A0A3'; FriendlyName = 'Intel Wi-Fi adapter'; Status = 'Unknown' }
+            @{ Id = 'USB\VID_1234&PID_5678'; FriendlyName = 'Front camera'; Status = 'Missing' }
+            @{ Id = 'PCI\VEN_10DE&DEV_2489'; FriendlyName = 'Display adapter'; Status = 'Incompatible' }
+            @{ Id = 'ACPI\PS2K'; FriendlyName = 'Keyboard controller'; Status = 'ProblemCode' }
+            @{ Id = 'PCI\VEN_1022&DEV_79A2'; FriendlyName = 'NVMe controller'; Status = 'Unhealthy' }
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Findings,Ok,Warning'
+        $r.Ok | Should -BeFalse
+        # ONE acknowledged warning, never one per device: Warning is a single
+        # object (an array of N warnings fails this assertion).
+        @($r.Warning).Count | Should -Be 1
+        $r.Warning -is [System.Collections.IDictionary] | Should -BeTrue
+        (@($r.Warning.Keys | Sort-Object) -join ',') | Should -Be 'Code,Devices,Message'
+        @($r.Warning.Devices).Count | Should -Be 5
+        (@(@($r.Warning.Devices) | ForEach-Object { $_.Status } | Sort-Object) -join ',') |
+            Should -Be 'Incompatible,Missing,ProblemCode,Unhealthy,Unknown'
+        # The single warning names every problem device, and the findings are
+        # retained for the summary (all five, input order, Id included).
+        foreach ($name in @('Intel Wi-Fi adapter', 'Front camera', 'Display adapter', 'Keyboard controller', 'NVMe controller')) {
+            $r.Warning.Message | Should -Match ([regex]::Escape($name))
+        }
+        @($r.Findings).Count | Should -Be 5
+        (@(@($r.Findings) | ForEach-Object { $_.Id }) -join ',') | Should -Be 'PCI\VEN_8086&DEV_A0A3,USB\VID_1234&PID_5678,PCI\VEN_10DE&DEV_2489,ACPI\PS2K,PCI\VEN_1022&DEV_79A2'
+        (@(@($r.Findings) | ForEach-Object { $_.FriendlyName }) -join ',') | Should -Be 'Intel Wi-Fi adapter,Front camera,Display adapter,Keyboard controller,NVMe controller'
+    }
+    It 'healthy devices alone produce no warning: Ok with a null Warning and empty findings' {
+        $devices = @(
+            @{ Id = 'PCI\VEN_8086'; FriendlyName = 'Healthy one'; Status = 'Ok' }
+            @{ Id = 'PCI\VEN_10DE'; FriendlyName = 'Healthy two'; Status = 'OK' }
+            @{ Id = 'USB\VID_9999'; FriendlyName = 'Healthy three'; Status = 'ok' }
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Findings,Ok,Warning'
+        $r.Ok | Should -BeTrue
+        $r.Warning | Should -BeNullOrEmpty
+        @($r.Findings).Count | Should -Be 0
+    }
+    It 'an empty or absent device list is not a warning: Ok with nothing to acknowledge' {
+        foreach ($r in @((Invoke-PnpValidation), (Invoke-PnpValidation -Devices @()))) {
+            $r.Ok | Should -BeTrue
+            $r.Warning | Should -BeNullOrEmpty
+            @($r.Findings).Count | Should -Be 0
+        }
+    }
+    It 'mixed input lists ONLY the problem devices in the warning and the findings' {
+        $devices = @(
+            @{ Id = 'A1'; FriendlyName = 'Fine disk'; Status = 'Ok' }
+            @{ Id = 'B2'; FriendlyName = 'Broken sensor'; Status = 'ProblemCode' }
+            @{ Id = 'C3'; FriendlyName = 'Fine bus'; Status = 'Ok' }
+            @{ Id = 'D4'; FriendlyName = 'Unhappy audio'; Status = 'Unhealthy' }
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        $r.Ok | Should -BeFalse
+        @($r.Warning.Devices).Count | Should -Be 2
+        @($r.Findings).Count | Should -Be 2
+        (@(@($r.Findings) | ForEach-Object { $_.Id }) -join ',') | Should -Be 'B2,D4'
+        $r.Warning.Message | Should -Not -Match 'Fine'
+    }
+    It 'a device without a Status indicator, an unrecognized token, or a null entry fails closed as a problem (Unknown)' {
+        $devices = @(
+            @{ Id = 'N1'; FriendlyName = 'No status field' }
+            @{ Id = 'N2'; FriendlyName = 'Alien token'; Status = 'SomeAlienState' }
+            $null
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        $r.Ok | Should -BeFalse
+        @($r.Findings).Count | Should -Be 3
+        (@(@($r.Findings) | ForEach-Object { $_.Status }) -join ',') | Should -Be 'Unknown,Unknown,Unknown'
+        (@(@($r.Findings) | ForEach-Object { $_.Id }) -join ',') | Should -Be 'N1,N2,'
+    }
+    It 'status tokens match case-insensitively and are canonicalized to the vocabulary' {
+        $devices = @(
+            @{ Id = 'C1'; FriendlyName = 'Lower missing'; Status = 'missing' }
+            @{ Id = 'C2'; FriendlyName = 'Shouting problem'; Status = 'PROBLEMCODE' }
+            @{ Id = 'C3'; FriendlyName = 'Mixed unhealthy'; Status = 'UnHealthy' }
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        (@(@($r.Findings) | ForEach-Object { $_.Status }) -join ',') | Should -Be 'Missing,ProblemCode,Unhealthy'
+    }
+    It 'accepts PSCustomObject device records (the read-back shape) as well as hashtables' {
+        $devices = @(
+            [pscustomobject]@{ Id = 'P1'; FriendlyName = 'Json device'; Status = 'Missing' }
+            [pscustomobject]@{ Id = 'P2'; FriendlyName = 'Json device ok'; Status = 'Ok' }
+        )
+        $r = Invoke-PnpValidation -Devices $devices
+        $r.Ok | Should -BeFalse
+        @($r.Findings).Count | Should -Be 1
+        @($r.Findings)[0].Id | Should -Be 'P1'
+        @($r.Findings)[0].Status | Should -Be 'Missing'
+    }
+    It 'returns FRESH findings and warning objects per call: mutating one result never changes the next' {
+        $devices = @(@{ Id = 'F1'; FriendlyName = 'Fresh check'; Status = 'Unknown' })
+        $first = Invoke-PnpValidation -Devices $devices
+        $first.Findings[0].Status = 'Tampered'
+        $first.Warning.Code = 'Tampered'
+        $first.Warning.Devices[0].Id = 'Tampered'
+        $second = Invoke-PnpValidation -Devices $devices
+        @($second.Findings)[0].Status | Should -Be 'Unknown'
+        $second.Warning.Code | Should -Be 'PnpDeviceIssues'
+        @($second.Warning.Devices)[0].Id | Should -Be 'F1'
+    }
+}
+
+Describe 'Get-TechnicianReviewOptions Technician Review options (Q29)' {
+    It 'returns exactly the three Q29 options in order' {
+        $options = Get-TechnicianReviewOptions
+        $options -is [System.Array] | Should -BeTrue
+        @($options).Count | Should -Be 3
+        (@($options) -join '|') | Should -Be 'Manual Remediation|Rescan Devices|Rerun Validation'
+    }
+    It 'returns a FRESH array per call: mutating one result never changes the options' {
+        $first = Get-TechnicianReviewOptions
+        $first[0] = 'Tampered'
+        (@((Get-TechnicianReviewOptions) -join '|')) | Should -Be 'Manual Remediation|Rescan Devices|Rerun Validation'
+    }
+}
+
+Describe 'Resolve-ResultState result-state truth table (Q67-Q72)' {
+    # Pester 5: describe-body code runs at discovery, so the shared warning
+    # object is staged in BeforeAll and read through $script: scope (the file
+    # convention) - a discovery-phase $w would read as $null inside every It
+    # and the warning rows would pass vacuously.
+    BeforeAll {
+        $script:w = @{ Code = 'PnpDeviceIssues'; Message = 'one device needs attention'; Devices = @(@{ Id = 'D1'; FriendlyName = 'Device'; Status = 'Unknown' }) }
+    }
+    It 'row 1: no warnings -> Completed' {
+        Resolve-ResultState -Warnings @() -FinishSubmitted $true | Should -Be 'Completed'
+        Resolve-ResultState -Warnings $null -FinishSubmitted $true | Should -Be 'Completed'
+        Resolve-ResultState -FinishSubmitted $false | Should -Be 'Completed'
+    }
+    It 'row 2: unresolved warnings (never asked) -> Completed with Warnings' {
+        Resolve-ResultState -Warnings @($script:w) -Acknowledged $null -FinishSubmitted $true | Should -Be 'Completed with Warnings'
+        Resolve-ResultState -Warnings @($script:w) -FinishSubmitted $true | Should -Be 'Completed with Warnings'
+    }
+    It 'row 3: acknowledged AND finish submitted -> Completed with Tech-Addressed Warnings' {
+        Resolve-ResultState -Warnings @($script:w) -Acknowledged $true -FinishSubmitted $true | Should -Be 'Completed with Tech-Addressed Warnings'
+    }
+    It 'row 4: finish WITHOUT acknowledgement -> Completed with Warnings' {
+        Resolve-ResultState -Warnings @($script:w) -Acknowledged $false -FinishSubmitted $true | Should -Be 'Completed with Warnings'
+    }
+    It 'acknowledged but NOT yet finished stays provisional: Completed with Warnings until the finish lands' {
+        Resolve-ResultState -Warnings @($script:w) -Acknowledged $true -FinishSubmitted $false | Should -Be 'Completed with Warnings'
+    }
+    It 'every row resolves to one of the three run states - the vocabulary is closed' {
+        $outcomes = @(
+            (Resolve-ResultState -Warnings @() -FinishSubmitted $true)
+            (Resolve-ResultState -Warnings @($script:w) -Acknowledged $null -FinishSubmitted $true)
+            (Resolve-ResultState -Warnings @($script:w) -Acknowledged $true -FinishSubmitted $true)
+            (Resolve-ResultState -Warnings @($script:w) -Acknowledged $false -FinishSubmitted $true)
+            (Resolve-ResultState -Warnings @($script:w) -Acknowledged $true -FinishSubmitted $false)
+        )
+        $allowed = @('Completed', 'Completed with Warnings', 'Completed with Tech-Addressed Warnings')
+        foreach ($o in $outcomes) { $allowed -contains $o | Should -BeTrue }
+    }
+    It 'the module source never names a hand-off-readiness verdict: no such state exists anywhere in it' {
+        $psm1 = Join-Path (Split-Path -Parent $script:modulePath) 'OSDeploy.Orchestrator.psm1'
+        $text = [System.IO.File]::ReadAllText($psm1)
+        $text | Should -Not -Match '(?i)ready[ \t\r\n]*for[ \t\r\n]*delivery'
+        $text | Should -Not -Match '(?i)readyfordelivery'
+        $text | Should -Not -Match '(?i)deliveryready'
+    }
+}
+
+Describe 'Invoke-BootEntryRegistration persistent Factory Recovery entry (Q94 orchestrator portion)' {
+    BeforeEach {
+        $script:btroot = Join-Path ([System.IO.Path]::GetTempPath()) ('orch-boot-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path $script:btroot 'State') -Force | Out-Null
+        # The Q94 deployment-only one-time boot override marker.
+        Write-AtomicJson -Path (Join-Path $script:btroot 'State\BootOverride.json') -Value @{
+            Override = 'deployment-only'
+        }
+        $script:marker = Join-Path $script:btroot 'State\BootOverride.json'
+        $script:goodTool = {
+            param($Context)
+            return @{ EntryPresent = $true; TimeoutSeconds = 5; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }
+        }
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:btroot -ErrorAction SilentlyContinue
+    }
+    It 'a fully successful report registers, validates, unblocks, and CLEARS the deployment-only override marker' {
+        $script:seen = @()
+        $tool = {
+            param($Context)
+            $script:seen += $Context
+            return @{ EntryPresent = $true; TimeoutSeconds = 5; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }
+        }
+        $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Blocked,Registered,Validated'
+        $r.Registered | Should -BeTrue
+        $r.Validated | Should -BeTrue
+        $r.Blocked | Should -BeFalse
+        # Success clears the deployment-only override (Q94).
+        Test-Path -LiteralPath $script:marker | Should -BeFalse
+        # The tool ran exactly once, with the partition root in its context.
+        @($script:seen).Count | Should -Be 1
+        $script:seen[0].PartitionRoot | Should -Be $script:btroot
+    }
+    It 'success with NO marker present is still a success (nothing to clear)' {
+        Remove-Item -LiteralPath $script:marker -Force
+        $r = Invoke-BootEntryRegistration -BootTool $script:goodTool -PartitionRoot $script:btroot
+        $r.Registered | Should -BeTrue
+        $r.Blocked | Should -BeFalse
+    }
+    It 'a missing entry blocks completion and the override marker REMAINS (never cleared on failure)' {
+        $tool = {
+            param($Context)
+            return @{ EntryPresent = $false; TimeoutSeconds = 5; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }
+        }
+        $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+        $r.Registered | Should -BeFalse
+        $r.Validated | Should -BeTrue
+        $r.Blocked | Should -BeTrue
+        Test-Path -LiteralPath $script:marker | Should -BeTrue
+    }
+    It 'a timeout other than five seconds blocks registration (the Q94 five-second contract)' {
+        foreach ($timeout in @(0, 1, 30)) {
+            # Build the tool with THIS loop's timeout baked into the report.
+            $tool = [scriptblock]::Create(('param($Context) return @{{ EntryPresent = $true; TimeoutSeconds = {0}; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }}' -f $timeout))
+            $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+            $r.Registered | Should -BeFalse
+            $r.Blocked | Should -BeTrue
+        }
+    }
+    It 'a non-Windows default blocks registration' {
+        $tool = {
+            param($Context)
+            return @{ EntryPresent = $true; TimeoutSeconds = 5; WindowsDefault = $false; PartitionIdentityOk = $true; BootFilesOk = $true }
+        }
+        $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+        $r.Registered | Should -BeFalse
+        $r.Blocked | Should -BeTrue
+        Test-Path -LiteralPath $script:marker | Should -BeTrue
+    }
+    It 'a partition-identity or boot-file validation failure blocks completion (ANY failure blocks)' {
+        foreach ($bad in @('PartitionIdentityOk', 'BootFilesOk')) {
+            $script:report = @{ EntryPresent = $true; TimeoutSeconds = 5; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }
+            $script:report[$bad] = $false
+            $tool = { param($Context) return $script:report }
+            $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+            $r.Registered | Should -BeTrue
+            $r.Validated | Should -BeFalse
+            $r.Blocked | Should -BeTrue
+        }
+    }
+    It 'a throwing boot tool fails closed to Blocked without throwing and never clears the marker' {
+        $r = Invoke-BootEntryRegistration -BootTool { throw 'bcdedit exploded' } -PartitionRoot $script:btroot
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'Blocked,Registered,Validated'
+        $r.Registered | Should -BeFalse
+        $r.Validated | Should -BeFalse
+        $r.Blocked | Should -BeTrue
+        Test-Path -LiteralPath $script:marker | Should -BeTrue
+    }
+    It 'a malformed report (missing fields) fails closed to Blocked, never an invented pass' {
+        foreach ($shape in @('empty', 'partial', 'object')) {
+            if ($shape -eq 'empty') { $script:report = @{} }
+            elseif ($shape -eq 'partial') { $script:report = @{ EntryPresent = $true } }
+            else { $script:report = [pscustomobject]@{ EntryPresent = $true; TimeoutSeconds = 5 } }
+            $tool = { param($Context) return $script:report }
+            $r = Invoke-BootEntryRegistration -BootTool $tool -PartitionRoot $script:btroot
+            $r.Registered | Should -BeFalse
+            $r.Blocked | Should -BeTrue
+        }
+    }
+    It 'success NEVER blindly deletes a directory squatting on the marker path: Blocked instead' {
+        Remove-Item -LiteralPath $script:marker -Force
+        New-Item -ItemType Directory -Path (Join-Path $script:marker 'Squat') -Force | Out-Null
+        $r = Invoke-BootEntryRegistration -BootTool $script:goodTool -PartitionRoot $script:btroot
+        $r.Blocked | Should -BeTrue
+        Test-Path -LiteralPath $script:marker | Should -BeTrue
+    }
+    It 'the default BootTool delegates to the module-internal real check with the partition-root context' {
+        Mock Invoke-RealBootEntryCheck -ModuleName OSDeploy.Orchestrator {
+            return @{ EntryPresent = $true; TimeoutSeconds = 5; WindowsDefault = $true; PartitionIdentityOk = $true; BootFilesOk = $true }
+        }
+        $r = Invoke-BootEntryRegistration -PartitionRoot $script:btroot
+        $r.Registered | Should -BeTrue
+        $r.Validated | Should -BeTrue
+        $r.Blocked | Should -BeFalse
+        Should -Invoke Invoke-RealBootEntryCheck -ModuleName OSDeploy.Orchestrator -Exactly 1 -Scope It -ParameterFilter {
+            $Context.PartitionRoot -eq $script:btroot
+        }
+    }
+    It 'the default BootTool is deploy-host-only: on a host without bcdedit it fails visible (Blocked) without throwing' {
+        $r = Invoke-BootEntryRegistration -PartitionRoot $script:btroot
+        $r.Blocked | Should -BeTrue
+        Test-Path -LiteralPath $script:marker | Should -BeTrue
+    }
+}
+
+Describe 'Invoke-LogFinalization gates the summary close on log verification (Q73)' {
+    BeforeEach {
+        $script:lfroot = Join-Path ([System.IO.Path]::GetTempPath()) ('orch-logfin-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:lfroot -Force | Out-Null
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:lfroot -ErrorAction SilentlyContinue
+    }
+    It 'a healthy run log verifies: SummaryMayClose is immediately $true' {
+        $log = New-RunLog -Root $script:lfroot -RunType 'InitialDeployment'
+        Add-LogEvent -Log $log -Event 'SuiteFixture'
+        $r = Invoke-LogFinalization -Log $log
+        (@($r.Keys | Sort-Object) -join ',') | Should -Be 'SummaryMayClose,Verified'
+        $r.Verified | Should -BeTrue
+        $r.SummaryMayClose | Should -BeTrue
+    }
+    It 'a corrupt events file keeps SummaryMayClose $false; the retry after repair releases the gate' {
+        $log = New-RunLog -Root $script:lfroot -RunType 'InitialDeployment'
+        Add-LogEvent -Log $log -Event 'SuiteFixture'
+        [System.IO.File]::AppendAllText($log.EventsPath, 'this line is not json' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+        $blocked = Invoke-LogFinalization -Log $log
+        $blocked.SummaryMayClose | Should -BeFalse
+        $blocked.Verified | Should -BeFalse
+        # Repair: rewrite the events file as valid JSONL; the RETRY re-verifies
+        # and returns $true (SummaryMayClose is false only until the log
+        # verifies).
+        $events = [System.IO.File]::ReadAllLines($log.EventsPath, [System.Text.Encoding]::ASCII) |
+            Where-Object { $_ -ne 'this line is not json' }
+        [System.IO.File]::WriteAllLines($log.EventsPath, $events, [System.Text.Encoding]::ASCII)
+        $released = Invoke-LogFinalization -Log $log
+        $released.Verified | Should -BeTrue
+        $released.SummaryMayClose | Should -BeTrue
+    }
+    It 'no events file at all (an active run folder) keeps the gate closed' {
+        $log = New-RunLog -Root $script:lfroot -RunType 'InitialDeployment'
+        $r = Invoke-LogFinalization -Log $log
+        $r.Verified | Should -BeFalse
+        $r.SummaryMayClose | Should -BeFalse
+    }
+    It 'a malformed log object (no EventsPath) fails closed without throwing' {
+        $r = Invoke-LogFinalization -Log ([pscustomobject]@{ Folder = 'not-a-log' })
+        $r.Verified | Should -BeFalse
+        $r.SummaryMayClose | Should -BeFalse
+    }
+}
+
+Describe 'Get-PhaseOrder phase sequence constant' {
+    It 'returns the exact nine-phase sequence in order, as an array' {
+        $order = Get-PhaseOrder
+        $order -is [System.Array] | Should -BeTrue
+        @($order).Count | Should -Be 9
+        (@($order) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup'
+    }
+    It 'returns a FRESH array per call: mutating one result never changes the sequence' {
+        $first = Get-PhaseOrder
+        $first[0] = 'Tampered'
+        (@((Get-PhaseOrder) -join ',')) | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup'
+    }
+}
