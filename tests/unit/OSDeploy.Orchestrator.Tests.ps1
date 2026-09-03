@@ -2421,6 +2421,123 @@ Describe 'Invoke-BootEntryRegistration persistent Factory Recovery entry (Q94 or
     }
 }
 
+# ---------------------------------------------------------------------------
+# Task 26 fix round 1: the bcdedit output parsing is a PURE internal unit
+# (Parse-BcdeditOutput) so the deploy-host capture model is testable on any
+# platform with fixture text. The canonical-order fixture reproduces the
+# exact case the review found broken: bcdedit emits an entry's fields as
+# identifier, device, path, description - the recovery entry's device and
+# path lines arrive BEFORE the description names the entry, so the old
+# inline capture (keyed on the description match) left both empty and
+# PartitionIdentityOk/BootFilesOk could never pass on a real host.
+# ---------------------------------------------------------------------------
+
+Describe 'Parse-BcdeditOutput per-entry field capture (Q94 fix round 1)' {
+    BeforeAll {
+        # Canonical bcdedit field order, with entry titles, dash rules, a
+        # blank separator, a multi-line displayorder continuation, and the
+        # persistent Factory Recovery entry LAST (device/path/description).
+        $script:canonicalLines = [string[]]@(
+            'Windows Boot Manager'
+            '--------------------'
+            'identifier              {bootmgr}'
+            'device                  partition=\Device\HarddiskVolume1'
+            'path                    \EFI\Microsoft\Boot\bootmgfw.efi'
+            'description             Windows Boot Manager'
+            'locale                  en-US'
+            'default                 {current}'
+            'displayorder            {current}'
+            '                        {77777777-7777-7777-7777-777777777777}'
+            'timeout                 30'
+            ''
+            'Windows Boot Loader'
+            '-------------------'
+            'identifier              {current}'
+            'device                  partition=C:'
+            'path                    \Windows\system32\winload.efi'
+            'description             Windows 11'
+            'recoveryenabled         Yes'
+            ''
+            'OSDeploy Factory Recovery'
+            '-------------------------'
+            'identifier              {77777777-7777-7777-7777-777777777777}'
+            'device                  partition=Z:'
+            'path                    \EFI\OSDeploy\recovery.wim'
+            'description             OSDeploy Factory Recovery'
+        )
+        # Parse-BcdeditOutput is module-INTERNAL (not exported), so the
+        # tests invoke it through the module's session state with
+        # & (Get-Module ...); the lines pass positionally into param(). No
+        # Mandatory here either: the canonical fixture carries bcdedit's
+        # blank separator lines (empty-string elements).
+        function Invoke-ParseBcdedit {
+            param([string[]]$Lines)
+            return (& (Get-Module -Name OSDeploy.Orchestrator) { param($L) Parse-BcdeditOutput -Lines $L } $Lines)
+        }
+    }
+    It 'parses one entry per identifier line, in output order, with the exact result shape' {
+        $parsed = Invoke-ParseBcdedit -Lines $script:canonicalLines
+        (@($parsed.Keys | Sort-Object) -join ',') | Should -Be 'Entries'
+        @($parsed.Entries).Count | Should -Be 3
+        (@(@($parsed.Entries) | ForEach-Object { $_.Identifier }) -join ',') |
+            Should -Be '{bootmgr},{current},{77777777-7777-7777-7777-777777777777}'
+    }
+    It 'THE FIX: canonical field order populates the recovery device and path that arrive BEFORE description' {
+        $parsed = Invoke-ParseBcdedit -Lines $script:canonicalLines
+        $recovery = @($parsed.Entries | Where-Object { $_.Identifier -eq '{77777777-7777-7777-7777-777777777777}' })
+        @($recovery).Count | Should -Be 1
+        # These two assertions are the exact case that failed before the
+        # fix: with capture gated on the description match, both fields
+        # stayed empty on real bcdedit output.
+        $recovery[0].Fields['device'] | Should -Be 'partition=Z:'
+        $recovery[0].Fields['path'] | Should -Be '\EFI\OSDeploy\recovery.wim'
+        $recovery[0].Fields['description'] | Should -Be 'OSDeploy Factory Recovery'
+    }
+    It 'captures the boot-manager defaults and the Windows loader path' {
+        $parsed = Invoke-ParseBcdedit -Lines $script:canonicalLines
+        $bootMgr = @($parsed.Entries | Where-Object { $_.Identifier -eq '{bootmgr}' })
+        $bootMgr[0].Fields['timeout'] | Should -Be '30'
+        $bootMgr[0].Fields['default'] | Should -Be '{current}'
+        $loader = @($parsed.Entries | Where-Object { $_.Identifier -eq '{current}' })
+        $loader[0].Fields['path'] | Should -Be '\Windows\system32\winload.efi'
+        $loader[0].Fields['device'] | Should -Be 'partition=C:'
+    }
+    It 'skips continuation lines (the first occurrence of a key wins) and entry titles open no entries' {
+        $parsed = Invoke-ParseBcdedit -Lines $script:canonicalLines
+        $bootMgr = @($parsed.Entries | Where-Object { $_.Identifier -eq '{bootmgr}' })
+        # The indented second displayorder GUID matched no field shape; the
+        # key keeps its FIRST value.
+        $bootMgr[0].Fields['displayorder'] | Should -Be '{current}'
+        # Three identifier lines - titles and dash rules opened nothing.
+        @($parsed.Entries).Count | Should -Be 3
+    }
+    It 'field capture is order-independent within an entry and stops at the next identifier line' {
+        $lines = [string[]]@(
+            'identifier              {recover}'
+            'description             OSDeploy Factory Recovery'
+            'path                    \EFI\OSDeploy\recovery.wim'
+            'device                  partition=Z:'
+            'identifier              {other}'
+            'description             Something else'
+        )
+        $parsed = Invoke-ParseBcdedit -Lines $lines
+        @($parsed.Entries).Count | Should -Be 2
+        $recover = @($parsed.Entries | Where-Object { $_.Identifier -eq '{recover}' })
+        $recover[0].Fields['description'] | Should -Be 'OSDeploy Factory Recovery'
+        $recover[0].Fields['device'] | Should -Be 'partition=Z:'
+        $recover[0].Fields['path'] | Should -Be '\EFI\OSDeploy\recovery.wim'
+        # Fields after the NEXT identifier line belong to that entry.
+        $other = @($parsed.Entries | Where-Object { $_.Identifier -eq '{other}' })
+        $other[0].Fields['description'] | Should -Be 'Something else'
+        @($other[0].Fields.Keys) -contains 'device' | Should -BeFalse
+    }
+    It 'empty input yields no entries' {
+        $parsed = Invoke-ParseBcdedit -Lines @()
+        (@($parsed.Keys | Sort-Object) -join ',') | Should -Be 'Entries'
+        @($parsed.Entries).Count | Should -Be 0
+    }
+}
+
 Describe 'Invoke-LogFinalization gates the summary close on log verification (Q73)' {
     BeforeEach {
         $script:lfroot = Join-Path ([System.IO.Path]::GetTempPath()) ('orch-logfin-' + [guid]::NewGuid().ToString('N'))

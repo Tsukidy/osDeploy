@@ -2756,37 +2756,79 @@ function Resolve-ResultState {
     return 'Completed with Warnings'
 }
 
-# Internal: locate the boot path line of the BCD entry whose identifier line
-# matches -Identifier, within the raw bcdedit enumeration lines. Returns the
-# path value ('' when the entry or its path line is not found).
-function Get-BcdEntryPath {
+# Internal: parse raw bcdedit /enum output into per-entry field tables.
+# PURE (no I/O) so the deploy-host parsing model is testable on any platform
+# against fixture text (fix round 1: the capture used to live inline in
+# Invoke-RealBootEntryCheck, gated on the recovery DESCRIPTION match, but
+# bcdedit emits device and path BEFORE description - so both stayed empty on
+# every real host and the phase could never validate).
+#
+# Capture model: a line matching 'identifier <value>' OPENS an entry; every
+# following '<word key> <value>' line belongs to THAT entry REGARDLESS OF
+# ORDER, until the next identifier line opens the next entry. bcdedit noise
+# that carries no word key is inert: an entry TITLE line and the dash rule
+# do not open entries (a title that FOLLOWS an entry attaches to it under
+# its first word - consumers read only the known field keys below, so the
+# noise never matters), and an indented continuation line (e.g. a second
+# displayorder GUID) matches no field shape and is skipped; the FIRST
+# occurrence of a key wins.
+#
+# Returns @{ Entries = @( @{ Identifier = '<id text>'; Fields = @{
+# <lowercase key> = <trimmed value> } } ... ) } in output order. The field
+# keys the projection reads: description, device, path (per entry) and
+# timeout, default (the {bootmgr} entry).
+function Parse-BcdeditOutput {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()]
-        [string[]]$Lines,
-        [Parameter(Mandatory)][string]$Identifier
+        # Deliberately NOT [Parameter(Mandatory)]: real bcdedit output has
+        # blank separator lines, and Mandatory on a string-array parameter
+        # rejects empty-string ELEMENTS - which would fail the whole check
+        # through the shell's catch and return the all-false report on every
+        # real host (probed on pwsh 7.4.2; found by the canonical fixture).
+        # A null Lines simply parses to zero entries.
+        [string[]]$Lines
     )
-    $inEntry = $false
+    $entries = @()
+    $current = $null
+    if ($null -eq $Lines) { return @{ Entries = @() } }
     foreach ($line in $Lines) {
         if ($line -match '^\s*identifier\s+(.+)$') {
-            if ($inEntry) { break }
-            if ($Matches[1].Trim() -eq $Identifier) { $inEntry = $true }
+            $current = @{ Identifier = $Matches[1].Trim(); Fields = @{} }
+            $entries += $current
             continue
         }
-        if ($inEntry -and $line -match '^\s*path\s+(.+)$') {
-            return $Matches[1].Trim()
+        if ($null -eq $current) { continue }
+        if ($line -match '^\s*([A-Za-z]+)\s+(.+)$') {
+            $key = $Matches[1].ToLowerInvariant()
+            if (-not $current.Fields.Contains($key)) {
+                $current.Fields[$key] = $Matches[2].Trim()
+            }
         }
     }
-    return ''
+    return @{ Entries = @($entries) }
+}
+
+# Internal: read one field from a Parse-BcdeditOutput entry, '' when absent.
+function Get-BcdEntryField {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $fields = Get-OrchestratorField -Record $Entry -Name 'Fields'
+    if ($null -eq $fields) { return '' }
+    if (-not $fields.Contains($Name)) { return '' }
+    return [string]$fields[$Name]
 }
 
 # Internal: the REAL deploy-host boot check behind the default BootTool.
-# Deploy-host-only: reads the BCD through bcdedit.exe (READ-ONLY /enum; the
-# engine never mutates the store here) and projects the Q94 report contract.
-# The bcdedit parsing below is best-effort and - like the WUA COM body in
-# Invoke-ScopedUpdatePass - belongs to the host wiring's live validation
-# pass; the REPORT CONTRACT and the registration logic above it are what the
-# suite locks through the injected -BootTool seam.
+# Deploy-host-only SHELL: obtains the raw text (bcdedit.exe, READ-ONLY
+# /enum all; the engine never mutates the store here) and delegates ALL
+# parsing to the pure Parse-BcdeditOutput. The projection below - like the
+# WUA COM body in Invoke-ScopedUpdatePass - belongs to the host wiring's
+# live validation pass; the PARSING MODEL and the REPORT CONTRACT are what
+# the suite locks (Parse-BcdeditOutput through fixture tests, the report
+# contract and registration logic through the injected -BootTool seam).
 #
 # Fail-visible contract: ANY failure - including bcdedit.exe being absent on
 # a non-Windows host - returns the all-false report so the caller fails
@@ -2797,11 +2839,11 @@ function Invoke-RealBootEntryCheck {
         [Parameter(Mandatory)]$Context
     )
     $report = @{
-        EntryPresent       = $false
-        TimeoutSeconds     = 0
-        WindowsDefault     = $false
+        EntryPresent        = $false
+        TimeoutSeconds      = 0
+        WindowsDefault      = $false
         PartitionIdentityOk = $false
-        BootFilesOk        = $false
+        BootFilesOk         = $false
     }
     try {
         # String interpolation, not Join-Path: the deploy-host path is
@@ -2810,76 +2852,68 @@ function Invoke-RealBootEntryCheck {
         $bcdedit = "$env:SystemRoot\System32\bcdedit.exe"
         if (-not (Test-Path -LiteralPath $bcdedit)) { return $report }
         $lines = [string[]](@(& $bcdedit /enum all) | ForEach-Object { [string]$_ })
+        if ($null -eq $lines) { $lines = [string[]]@() }
+        $parsed = Parse-BcdeditOutput -Lines $lines
 
         # Entry presence: the persistent Factory Recovery entry's
-        # description (the entry description string the host wiring
-        # registers; matched case-insensitively).
-        $recoveryIdentifier = ''
-        $lastIdentifier = ''
-        $recoveryDevice = ''
-        $recoveryPath = ''
-        foreach ($line in $lines) {
-            if ($line -match '^\s*identifier\s+(.+)$') {
-                $lastIdentifier = $Matches[1].Trim()
-                continue
-            }
-            if ($line -match '^\s*description\s+(.+)$') {
-                if ($Matches[1] -imatch 'OSDeploy Factory Recovery') {
-                    $recoveryIdentifier = $lastIdentifier
-                }
-                continue
-            }
-            if ($recoveryIdentifier -ne '' -and $lastIdentifier -eq $recoveryIdentifier) {
-                if ($recoveryDevice -eq '' -and $line -match '^\s*device\s+partition=(.+)$') {
-                    $recoveryDevice = $Matches[1].Trim()
-                }
-                elseif ($recoveryPath -eq '' -and $line -match '^\s*path\s+(.+)$') {
-                    $recoveryPath = $Matches[1].Trim()
-                }
-            }
+        # description (the description string the host wiring registers;
+        # matched case-insensitively).
+        $recovery = $null
+        foreach ($entry in @($parsed.Entries)) {
+            $description = Get-BcdEntryField -Entry $entry -Name 'description'
+            if ($description -imatch 'OSDeploy Factory Recovery') { $recovery = $entry }
         }
-        if ($recoveryIdentifier -eq '') { return $report }
+        if ($null -eq $recovery) { return $report }
         $report.EntryPresent = $true
 
-        # Boot manager defaults: the {bootmgr} section's timeout and default.
-        $timeoutSeconds = 0
-        $defaultTarget = ''
-        $inBootMgr = $false
-        foreach ($line in $lines) {
-            if ($line -match '^\s*identifier\s+\{bootmgr\}') { $inBootMgr = $true; continue }
-            if ($line -match '^\s*identifier\s+' -and $inBootMgr) { $inBootMgr = $false; continue }
-            if (-not $inBootMgr) { continue }
-            if ($line -match '^\s*timeout\s+(\d+)') { $timeoutSeconds = [int]$Matches[1] }
-            if ($defaultTarget -eq '' -and $line -match '^\s*default\s+(.+)$') { $defaultTarget = $Matches[1].Trim() }
+        # Boot manager defaults: the {bootmgr} entry's timeout and default.
+        $bootMgr = $null
+        foreach ($entry in @($parsed.Entries)) {
+            if ([string]$entry.Identifier -ieq '{bootmgr}') { $bootMgr = $entry }
         }
-        $report.TimeoutSeconds = $timeoutSeconds
+        $timeoutText = ''
+        $defaultTarget = ''
+        if ($null -ne $bootMgr) {
+            $timeoutText = Get-BcdEntryField -Entry $bootMgr -Name 'timeout'
+            $defaultTarget = Get-BcdEntryField -Entry $bootMgr -Name 'default'
+        }
+        if ($timeoutText -match '^(\d+)$') { $report.TimeoutSeconds = [int]$Matches[1] }
         # Windows is the default when the boot manager's default entry is
         # the Windows loader (winload), not the recovery entry.
-        if ($defaultTarget -ne '' -and $defaultTarget -ne $recoveryIdentifier) {
-            $defaultPath = Get-BcdEntryPath -Lines $lines -Identifier $defaultTarget
-            if ($defaultPath -match '(?i)winload\.(efi|exe)') { $report.WindowsDefault = $true }
+        if ($defaultTarget -ne '' -and $defaultTarget -ine [string]$recovery.Identifier) {
+            $defaultEntry = $null
+            foreach ($entry in @($parsed.Entries)) {
+                if ([string]$entry.Identifier -ieq $defaultTarget) { $defaultEntry = $entry }
+            }
+            if ($null -ne $defaultEntry) {
+                $defaultPath = Get-BcdEntryField -Entry $defaultEntry -Name 'path'
+                if ($defaultPath -match '(?i)winload\.(efi|exe)') { $report.WindowsDefault = $true }
+            }
         }
 
         # Partition identity: the recovery entry boots from the partition
         # the orchestrator is running from (the PartitionRoot's drive).
         $root = [string](Get-OrchestratorField -Record $Context -Name 'PartitionRoot')
+        $deviceText = Get-BcdEntryField -Entry $recovery -Name 'device'
+        $recoveryDevice = ''
+        if ($deviceText -match '^partition=(.+)$') { $recoveryDevice = $Matches[1].Trim() }
         if ($recoveryDevice -ne '' -and $root -ne '') {
             $rootDrive = ([System.IO.Path]::GetPathRoot($root.TrimEnd('\')) + '\')
             if ($rootDrive -ne '\' -and $recoveryDevice.TrimEnd('\') -ieq $rootDrive.TrimEnd('\')) {
                 $report.PartitionIdentityOk = $true
             }
         }
-        else {
-            # No partition root in the context and no device to compare is
-            # not a validated identity - fail closed.
-            $report.PartitionIdentityOk = $false
-        }
+        # No partition root in the context and no device to compare is not a
+        # validated identity - fail closed (the fields stay $false).
 
         # Boot files: the recovery entry's declared path exists on its
         # declared device partition.
-        if ($report.PartitionIdentityOk -and $recoveryPath -ne '') {
-            $bootFile = Join-Path ($recoveryDevice.TrimEnd('\') + '\') $recoveryPath.TrimStart('\')
-            if (Test-Path -LiteralPath $bootFile) { $report.BootFilesOk = $true }
+        if ($report.PartitionIdentityOk) {
+            $recoveryPath = Get-BcdEntryField -Entry $recovery -Name 'path'
+            if ($recoveryPath -ne '') {
+                $bootFile = Join-Path ($recoveryDevice.TrimEnd('\') + '\') $recoveryPath.TrimStart('\')
+                if (Test-Path -LiteralPath $bootFile) { $report.BootFilesOk = $true }
+            }
         }
         return $report
     }
