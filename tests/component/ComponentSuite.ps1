@@ -535,8 +535,19 @@ catch {
             Assert-True ([bool]$seqReg.Ok) '5.0a the real task registration (suite-unique name) returns Ok before the sequence runs'
             Assert-True ((Test-Path -LiteralPath (Join-Path $script:suitePartition 'State\TaskRegistration.json')) -and (Test-Path -LiteralPath $runtimeDir) -and (Test-Path -LiteralPath (Join-Path $script:suitePartition 'State\BootOverride.json'))) '5.0b the completion footprint (marker, runtime directory, boot override) is staged before the sequence runs'
             $seqStatePath = Join-Path $script:suitePartition 'State\DeploymentState.json'
+            # Pre-flight diagnostic (first Windows run stopped at the entry
+            # integrity gate): probe the fixture's record DIRECTLY so the log
+            # names the failing comparison (Missing/Changed/Extra/BundleHash/
+            # InvalidRecord) and shows the path forms both sides use.
+            $diagRecord = Read-JsonFile -Path (Join-Path $script:suitePartition 'State\IntegrityRecord.json')
+            $diagCheck = Test-Integrity -Directory $runtimeDir -Record $diagRecord
+            $diagFresh = New-FileInventory -Path $runtimeDir
+            $diagRecordPath = [string](Get-SuiteJsonField -Record @(Get-SuiteJsonField -Record $diagRecord -Name 'FileHashes')[0] -Name 'Path')
+            $diagFreshPath = [string](Get-SuiteJsonField -Record @($diagFresh)[0] -Name 'Path')
+            Write-Output ('DIAG 5.0c fixture Test-Integrity: Ok=' + [string]$diagCheck.Ok + ' Mismatches=' + ((@($diagCheck.Mismatches) | ForEach-Object { '{0}:{1}' -f [string](Get-SuiteJsonField -Record $_ -Name 'Path'), [string](Get-SuiteJsonField -Record $_ -Name 'Reason') }) -join ' | '))
+            Write-Output ('DIAG 5.0d path forms - record: [' + $diagRecordPath + ']  fresh: [' + $diagFreshPath + ']')
             $seqResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable)
-            Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result)
+            Assert-True ($seqResult.Outcome -eq 'Completed' -and [bool]$seqResult.Completed -and [string]$seqResult.Result -eq 'Completed') ('5.1 the sequence completes: Outcome Completed, Completed True, Result Completed (found Outcome {0}, Completed {1}, Result {2}, Reason {3})' -f [string]$seqResult.Outcome, [string]$seqResult.Completed, [string]$seqResult.Result, [string]$seqResult.Reason)
             $seqStateRaw = [System.IO.File]::ReadAllText($seqStatePath)
             $seqValidation = Test-DeploymentState -Record (Read-JsonFile -Path $seqStatePath)
             Assert-True ([bool]$seqValidation.Valid) ('5.2 the completed DeploymentState.json passes Test-DeploymentState (errors: {0})' -f (($seqValidation.Errors) -join '; '))
@@ -739,7 +750,7 @@ catch {
                 return $true
             }
             $rebootResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners $rebootTable
-            Assert-True ($rebootResult.Outcome -eq 'RebootPending' -and [string]$rebootResult.Phase -eq 'Drivers' -and -not [bool]$rebootResult.Completed) ('8.3 a restart-requesting Drivers phase returns RebootPending (found Outcome {0}, Phase {1})' -f [string]$rebootResult.Outcome, [string]$rebootResult.Phase)
+            Assert-True ($rebootResult.Outcome -eq 'RebootPending' -and [string]$rebootResult.Phase -eq 'Drivers' -and -not [bool]$rebootResult.Completed) ('8.3 a restart-requesting Drivers phase returns RebootPending (found Outcome {0}, Phase {1}, Reason {2})' -f [string]$rebootResult.Outcome, [string]$rebootResult.Phase, [string]$rebootResult.Reason)
             $rebootResume = Get-ResumePoint -Path $handoffStatePath
             $rebootValidation = Test-DeploymentState -Record (Read-JsonFile -Path $handoffStatePath)
             Assert-True ((@($rebootResume.CompletedPhases) -join ',') -eq 'Drivers' -and [bool]$rebootResume.RebootPending -and [bool]$rebootValidation.Valid) '8.4 the pre-reboot checkpoint is contract-valid: Drivers completed, RebootPending durable'
@@ -761,7 +772,7 @@ catch {
                 }
             }
             $resumeResult = Invoke-DeploymentSequence -PartitionRoot $script:suitePartition -PhaseRunners (New-SuiteRunnerTable) -IdentityProvider $stagedIdentityProvider
-            Assert-True ($resumeResult.Outcome -eq 'Completed' -and [string]$resumeResult.Result -eq 'Completed') ('8.5 the post-reboot re-entry completes the sequence (found Outcome {0})' -f [string]$resumeResult.Outcome)
+            Assert-True ($resumeResult.Outcome -eq 'Completed' -and [string]$resumeResult.Result -eq 'Completed') ('8.5 the post-reboot re-entry completes the sequence (found Outcome {0}, Reason {1})' -f [string]$resumeResult.Outcome, [string]$resumeResult.Reason)
             $finalResume = Get-ResumePoint -Path $handoffStatePath
             $driversCount = @($finalResume.CompletedPhases | Where-Object { $_ -eq 'Drivers' }).Count
             Assert-True ((@($finalResume.CompletedPhases) -join ',') -eq $expectedPhases -and $driversCount -eq 1) ('8.6 the resumed checkpoint records the full sequence exactly once per phase (Drivers appears {0} time(s))' -f $driversCount)
