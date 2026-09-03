@@ -116,6 +116,7 @@ function Get-SuiteJsonField {
 # --- Module and fixture wiring (paths relative to this script) --------------
 $script:modulePath = Join-Path $PSScriptRoot '..\..\src\Orchestrator\OSDeploy.Orchestrator.psd1'
 $script:guiModulePath = Join-Path $PSScriptRoot '..\..\src\Shared\OSDeploy.Gui\OSDeploy.Gui.psd1'
+$script:loggingModulePath = Join-Path $PSScriptRoot '..\..\src\Shared\OSDeploy.Logging\OSDeploy.Logging.psd1'
 # The mock builder also imports OSDeploy.State/Util/Config, so Read-JsonFile
 # and Test-DeploymentState are available below for state verification.
 . (Join-Path $PSScriptRoot '..\mocks\New-MockPartition.ps1')
@@ -123,6 +124,10 @@ Import-Module $script:modulePath -Force
 # The Gui module imports cleanly on any host (it loads no WPF assemblies at
 # import time); the WPF assemblies themselves load inside check 7.
 Import-Module $script:guiModulePath -Force
+# Logging is imported for THIS session: the orchestrator module's internal
+# import does not leak to its caller, and the suite itself stages and
+# verifies run logs (New-RunLog / Add-LogEvent / Complete-RunLog).
+Import-Module $script:loggingModulePath -Force
 
 # --- Run transcript: the VM-run evidence file -------------------------------
 # Started here (after the platform guard) so Linux runs NEVER create it.
