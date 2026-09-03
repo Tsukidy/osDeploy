@@ -3059,3 +3059,367 @@ function Invoke-LogFinalization {
     }
     return @{ SummaryMayClose = $verified; Verified = $verified }
 }
+
+# ---------------------------------------------------------------------------
+# The phase-sequence conductor (Q35/Q36/Q89): Invoke-DeploymentSequence walks
+# PHASE_ORDER through the Task 18 resume engine and completes through
+# Complete-Deployment. The sequence is a CONDUCTOR, not a second engine:
+# attempts, checkpointing, reboot marking, and idempotent resume all come
+# from Invoke-Phase / Invoke-WithAttempts.
+# ---------------------------------------------------------------------------
+
+# The partition root the conductor is currently walking. The default phase
+# actions below address the partition through THIS module-scope variable
+# instead of a closure: GetNewClosure re-binds a scriptblock to a throwaway
+# dynamic module whose $script: scope is empty and whose chain cannot see
+# module-internal functions (probed on pwsh 7.4.2), while a plain
+# module-authored scriptblock resolves both. Sharing one root is safe
+# BECAUSE the single-instance contract (Q35/Q36) admits exactly one
+# conductor per process at a time; the conductor sets this right after a
+# successful entry.
+$script:SequencePartitionRoot = ''
+
+function New-PhaseAction {
+    <#
+        .SYNOPSIS
+        Returns the DEFAULT action scriptblock for one PHASE_ORDER entry.
+
+        .DESCRIPTION
+        The default phase-to-function mapping (the deploy-host wiring).
+        Every action follows the module-wide failure convention: throwing
+        or returning exactly boolean $false is a FAILURE into the attempt
+        engine (three automatic attempts, then the blocking Technician
+        Review); anything else is success. Each action addresses the
+        partition through $script:SequencePartitionRoot, which the
+        conductor binds after entering.
+
+        - Drivers: Invoke-DriverPhase over Sources\Drivers (real silent
+          installer execution through the pattern engine, Q96/Q27). An
+          Ok = $false result - including unresolved driver failures already
+          routed to review by the phase itself - is a phase failure.
+        - Applications: Invoke-ApplicationPhase over the per-workflow
+          manifest Sources\Apps\<Workflow>\manifest.json (Q25/Q26). A
+          missing or malformed manifest throws inside the phase (fail
+          closed); exhausted entries (Ok = $false) fail the phase here -
+          the Q26 Acknowledge-and-Continue modal is the review-path
+          consumer's job, not the unattended sequence's.
+        - WorkflowSpecifics: EZT -> Invoke-EztAccountPhase against the
+          module's default registry store (its default Runner is the
+          recorder; the real Windows account operations arrive with the
+          host wiring, which also binds the real registry adapter into the
+          store). MMC -> Invoke-MmcFinalize (the real sysprep default);
+          a SysprepFailure outcome is a phase failure (Q32: the machine
+          stays in Audit Mode behind a blocking review). Any other
+          workflow token THROWS - workflow semantics are never guessed.
+        - WindowsUpdate: Invoke-UpdatePhase online with MaxCycles read
+          from the staged effective configuration
+          (Sources\Config\effective-config.json, Q88), defaulting to the
+          engine default 3 when the file or field is absent. A
+          RebootRequired report is translated into the sequence-level
+          restart signal (Set-OrchestrationRestartRequested); the
+          post-reboot cycle continuation (-ResumeContext) is re-driven by
+          the host wiring's runner because the phase engine records the
+          phase complete when the restart is requested.
+        - Activation: Invoke-ActivationFlow with 'Succeeded' - the
+          recorder-form default (the deploy-host-only pattern: the real
+          activation call, with its transient product-key handling, arrives
+          with the host wiring as an injected PhaseRunners override). An
+          Incomplete surface would be a phase failure (the Q19 choices are
+          the review path's to present).
+        - FinalValidation: the deploy-host PnP rescan (Get-PnpDevice)
+          mapped onto the Q28 vocabulary and judged by
+          Invoke-PnpValidation. The rescan is Windows-only: on any other
+          host the absent cmdlet throws and the attempt engine routes to
+          review (fail closed, never an invented clean scan). The one
+          acknowledged warning (Q28) and the Q29 review options belong to
+          the consumer acting on the failure.
+        - BootEntryRegistration: Invoke-BootEntryRegistration against the
+          partition root. Blocked = $true is a phase FAILURE routed to
+          review, never a skip - the sequence must not complete behind an
+          unregistered or unvalidated Factory Recovery entry.
+        - LogFinalization: Invoke-LogFinalization (the Q73 pre-cleanup
+          summary gate) on the CURRENT run log - the newest run folder
+          under <PartitionRoot>\Logs, located with Get-CurrentRunLog. The
+          scheduled-task host wrapper creates the run folder at launch;
+          the sequence deliberately does not. No run folder at all, or
+          SummaryMayClose = $false, is a phase failure.
+        - Cleanup: a deliberate no-op success. The destructive removal is
+          Complete-Deployment's own step 2 (Invoke-Cleanup, idempotent),
+          which the conductor invokes immediately after this action - the
+          Q89 order stays in exactly one place.
+
+        A PHASE_ORDER entry with no case below THROWS: a phase is never
+        silently skipped or defaulted beyond its wiring.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Phase
+    )
+    switch ($Phase) {
+        'Drivers' {
+            return {
+                $r = Invoke-DriverPhase -Root (Join-Path $script:SequencePartitionRoot 'Sources\Drivers')
+                if (-not $r.Ok) { return $false }
+                return $true
+            }
+        }
+        'Applications' {
+            return {
+                $state = (Get-RequiredContext).State
+                $manifest = Join-Path $script:SequencePartitionRoot ('Sources\Apps\' + $state.Workflow + '\manifest.json')
+                $r = Invoke-ApplicationPhase -ManifestPath $manifest
+                if (-not $r.Ok) { return $false }
+                return $true
+            }
+        }
+        'WorkflowSpecifics' {
+            return {
+                $state = (Get-RequiredContext).State
+                $workflow = [string]$state.Workflow
+                if ($workflow -ieq 'MMC') {
+                    $r = Invoke-MmcFinalize
+                    if ($r.Outcome -ne 'Complete') { return $false }
+                    return $true
+                }
+                if ($workflow -ieq 'EZT') {
+                    # Throws on step failure; the Winlogon re-assertion
+                    # seeds the module's default registry store.
+                    $null = Invoke-EztAccountPhase -Registry $script:RegistryStore
+                    return $true
+                }
+                throw ("WorkflowSpecifics has no wiring for workflow '{0}'; workflow semantics are never guessed." -f $workflow)
+            }
+        }
+        'WindowsUpdate' {
+            return {
+                $maxCycles = 3
+                $snapshotPath = Join-Path $script:SequencePartitionRoot 'Sources\Config\effective-config.json'
+                if (Test-Path -LiteralPath $snapshotPath) {
+                    # A parse failure throws (fail closed into the attempt
+                    # engine); only an absent file or field falls back to 3.
+                    $snapshot = Read-JsonFile -Path $snapshotPath
+                    $section = Get-OrchestratorField -Record $snapshot -Name 'WindowsUpdate'
+                    $field = $null
+                    if ($null -ne $section) { $field = Get-OrchestratorField -Record $section -Name 'MaxCycles' }
+                    if ($null -ne $field) { $maxCycles = [int]$field }
+                }
+                $r = Invoke-UpdatePhase -MaxCycles $maxCycles
+                if (-not $r.Ok) { return $false }
+                # Strict-mode-safe read: the non-reboot success shapes carry
+                # no RebootPending key at all.
+                $rebootField = Get-OrchestratorField -Record $r -Name 'RebootPending'
+                if ($null -ne $rebootField -and [bool]$rebootField) {
+                    Set-OrchestrationRestartRequested
+                }
+                return $true
+            }
+        }
+        'Activation' {
+            return {
+                $r = Invoke-ActivationFlow -ActivationResult 'Succeeded'
+                if ($r.Incomplete) { return $false }
+                return $true
+            }
+        }
+        'FinalValidation' {
+            return {
+                $devices = @(Get-PnpDevice | ForEach-Object {
+                    [pscustomobject]@{
+                        Id           = $_.InstanceId
+                        FriendlyName = $_.FriendlyName
+                        Status       = [string]$_.Status
+                    }
+                })
+                $r = Invoke-PnpValidation -Devices $devices
+                if (-not $r.Ok) { return $false }
+                return $true
+            }
+        }
+        'BootEntryRegistration' {
+            return {
+                $r = Invoke-BootEntryRegistration -PartitionRoot $script:SequencePartitionRoot
+                if ($r.Blocked) { return $false }
+                return $true
+            }
+        }
+        'LogFinalization' {
+            return {
+                $log = Get-CurrentRunLog -LogsRoot (Join-Path $script:SequencePartitionRoot 'Logs')
+                if ($null -eq $log) { return $false }
+                $r = Invoke-LogFinalization -Log $log
+                if (-not $r.SummaryMayClose) { return $false }
+                return $true
+            }
+        }
+        'Cleanup' {
+            return {
+                # No-op success: the destructive work is Complete-Deployment's
+                # own step 2 (Invoke-Cleanup, idempotent), invoked by the
+                # conductor right after this action.
+                return $true
+            }
+        }
+        default {
+            throw ("No default action is wired for phase '{0}'; wire it in New-PhaseAction or inject a PhaseRunners override." -f $Phase)
+        }
+    }
+}
+
+function Invoke-DeploymentSequence {
+    <#
+        .SYNOPSIS
+        Walks PHASE_ORDER through the resume engine and completes the run.
+
+        .DESCRIPTION
+        The conductor over the whole installed-Windows deployment sequence.
+        Enter-Orchestrator provides the single-instance gate and loads the
+        authoritative checkpoint from <PartitionRoot>\State\
+        DeploymentState.json (the file is the only state source). Every
+        phase in Get-PhaseOrder is then handed to Invoke-Phase with the
+        mapped action scriptblock; attempts, per-attempt checkpointing,
+        reboot marking, and idempotent resume (a completed phase's action is
+        NEVER re-invoked, Q35) are the Task 18 engine's. The sequence is
+        re-entrant: a RebootPending outcome is returned to the caller -
+        the SYSTEM STARTUP SCHEDULED TASK re-enters this function at the
+        next boot, and Enter-Orchestrator reloads the checkpoint then. A
+        crash mid-sequence (power loss) leaves the checkpoint recording
+        exactly the completed prefix plus the in-flight attempt; the next
+        entry resumes by invoking ONLY the incomplete phase's action. The
+        Q35 post-reboot IDENTITY gate (Resume-AfterReboot) is the host
+        wiring's step before re-entry - this function deliberately performs
+        no identity comparison of its own.
+
+        ACTION MAPPING: each PHASE_ORDER entry resolves to an action through
+        -PhaseRunners first (a hashtable of phase name -> scriptblock; the
+        integration seam) and New-PhaseAction otherwise (the deploy-host
+        default wiring - see its doc comment for the per-phase mapping).
+        BootEntryRegistration records complete ONLY when the boot entry is
+        NOT Blocked; LogFinalization only when the current run log verifies
+        (SummaryMayClose); both are phase failures into the attempt engine
+        otherwise - routed to the blocking Technician Review, never
+        skipped.
+
+        COMPLETION: after the Cleanup phase's action, the conductor calls
+        Complete-Deployment -Handoff 'Completed' -RequiredPhases <every
+        phase before Cleanup> - the RequiredWorkIncomplete gate is real
+        here. The result-state label resolution (Q67-Q72: the
+        warnings-based 'Completed with Warnings' family) is the consumer's
+        step over the recorded warnings; the conductor records the fixed
+        'Completed' handoff. Complete-Deployment keeps its own internal
+        post-cleanup log re-verification as the redundant second gate
+        behind the LogFinalization phase (the Q73 pre-cleanup gate).
+
+        RETURN SHAPES (exactly these keys):
+        - @{ Outcome = 'SecondInstance'; Phase = $null; Completed = $false;
+           Result = $null } - Enter-Orchestrator returned Ran = $false
+           (Q35/Q36: a concurrent launch exits without work or state
+           mutation).
+        - @{ Outcome = 'RebootPending'; Phase = <phase>; Completed = $false;
+           Result = $null } - a phase completed but requested a restart;
+           the caller (the Scheduled Task at next boot) re-enters.
+        - @{ Outcome = 'TechnicianReview'; Phase = <phase>; Completed =
+           $false; Result = $null } - the phase exhausted its automatic
+           attempts (or returned a blocking failure shape); the sequence
+           stopped. The caller blocks - there is no Ignore/Continue-Anyway
+           path.
+        - @{ Outcome = 'Blocked'; Phase = 'Cleanup'; Completed = $false;
+           BlockedBy = <Complete-Deployment token>; Result = $null } -
+           Complete-Deployment refused to record completion
+           (CleanupFailure or LogVerification; RequiredWorkIncomplete
+           cannot occur through this conductor). The state carries the
+           durable block record, and a re-entry retries the completion
+           order with every phase already recorded complete.
+        - @{ Outcome = 'Completed'; Phase = 'Cleanup'; Completed = $true;
+           Result = 'Completed' } - the run is recorded: Result,
+           Completed = $true, CompletedUtc written atomically by
+           Complete-Deployment, recovery content retained.
+        - @{ Outcome = 'PostCompletionRestart'; Phase = 'Cleanup';
+           Completed = $true; Ok = <bool>; Result = $null } - the state
+           already carries a Result, so Complete-Deployment delegated to
+           the Q89 cleanup-only restart; Ok is that cleanup's result.
+
+        PhaseRunners is validated BEFORE any entry is attempted: an unknown
+        phase name or a non-scriptblock value throws (a typo'd phase would
+        otherwise silently never run), and the single-instance lock is
+        never touched on that path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [hashtable]$PhaseRunners
+    )
+    if ($null -ne $PhaseRunners) {
+        $known = Get-PhaseOrder
+        foreach ($key in @($PhaseRunners.Keys)) {
+            if ($known -notcontains $key) {
+                throw ("PhaseRunners key '{0}' is not a PHASE_ORDER phase; a typo'd override would silently never run." -f $key)
+            }
+            $value = $PhaseRunners[$key]
+            if ($null -eq $value -or -not ($value -is [scriptblock])) {
+                throw ("PhaseRunners['{0}'] must be a scriptblock (the phase action), got '{1}'." -f $key, $value)
+            }
+        }
+    }
+    $entry = Enter-Orchestrator -PartitionRoot $PartitionRoot
+    if (-not $entry.Ran) {
+        return @{ Outcome = 'SecondInstance'; Phase = $null; Completed = $false; Result = $null }
+    }
+    # Bind the partition root the default actions address. Safe to hold in
+    # module scope because the single-instance contract admits exactly one
+    # conductor per process at a time.
+    $script:SequencePartitionRoot = $PartitionRoot
+    $order = Get-PhaseOrder
+    foreach ($phase in $order) {
+        $action = $null
+        if ($null -ne $PhaseRunners -and $PhaseRunners.Contains($phase)) {
+            $action = $PhaseRunners[$phase]
+        }
+        else {
+            $action = New-PhaseAction -Phase $phase
+        }
+        $result = Invoke-Phase -Phase $phase -Action $action
+        if ($result.Outcome -eq 'RebootPending') {
+            # The phase is complete and the marker is durable; the caller
+            # restarts the machine and the Scheduled Task re-enters here.
+            return @{ Outcome = 'RebootPending'; Phase = $phase; Completed = $false; Result = $null }
+        }
+        if ($result.Outcome -eq 'TechnicianReview') {
+            # Blocking: the sequence stops at the failed phase. No later
+            # phase runs and completion is never recorded.
+            return @{ Outcome = 'TechnicianReview'; Phase = $phase; Completed = $false; Result = $null }
+        }
+        # 'Complete' or 'Skipped' (idempotent resume) - walk on.
+        if ($phase -eq 'Cleanup') {
+            $required = @($order | Where-Object { $_ -ne 'Cleanup' })
+            $completion = Complete-Deployment -PartitionRoot $PartitionRoot -Handoff 'Completed' -RequiredPhases $required
+            if ($completion -is [System.Collections.IDictionary] -and $completion.Contains('Completed')) {
+                if (-not [bool]$completion['Completed']) {
+                    return @{
+                        Outcome   = 'Blocked'
+                        Phase     = 'Cleanup'
+                        Completed = $false
+                        BlockedBy = $completion['BlockedBy']
+                        Result    = $null
+                    }
+                }
+                return @{
+                    Outcome   = 'Completed'
+                    Phase     = 'Cleanup'
+                    Completed = $true
+                    Result    = $completion['Result']
+                }
+            }
+            # Complete-Deployment returned the Invoke-PostCompletionRestart
+            # cleanup shape (@{ Ok; Failures }): the state file already
+            # carries a Result, so this entry was a post-completion restart
+            # and only cleanup ran (Q89).
+            return @{
+                Outcome   = 'PostCompletionRestart'
+                Phase     = 'Cleanup'
+                Completed = $true
+                Ok        = [bool]$completion['Ok']
+                Result    = $null
+            }
+        }
+    }
+}

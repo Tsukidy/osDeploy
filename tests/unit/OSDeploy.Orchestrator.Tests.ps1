@@ -2597,3 +2597,325 @@ Describe 'Get-PhaseOrder phase sequence constant' {
         (@((Get-PhaseOrder) -join ',')) | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup'
     }
 }
+
+# ---------------------------------------------------------------------------
+# Task 27: the phase-sequence conductor. Invoke-DeploymentSequence walks
+# PHASE_ORDER through the Task 18 resume engine and completes through
+# Complete-Deployment. Every test stages a FRESH mock partition whose newest
+# run folder is healthy (the default LogFinalization action and
+# Complete-Deployment's final-log gate both verify it), then resets this
+# process to a fresh-context shape: any mutex a previous test's entry still
+# holds is released THROUGH THE OLD MODULE COPY FIRST (a bare re-import
+# would orphan the named mutex and turn every later entry into a false
+# second instance), and only then is the module re-imported with -Force -
+# the same file-only-state reset the Task 18 round-trip tests use.
+# ---------------------------------------------------------------------------
+
+Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
+    BeforeAll {
+        # Counting runner table for the deploy-host-only phases: every listed
+        # phase is scripted to succeed and its invocations are counted in
+        # $script:seqCounts, so the resume tests can prove ZERO
+        # already-completed phase re-invocations. The phase name is BAKED
+        # into a literal scriptblock through Invoke-Expression deliberately:
+        # GetNewClosure would re-bind the runner to a throwaway dynamic
+        # module whose $script: scope is empty (probed: 'Cannot index into a
+        # null array'), while a literal block created in this scope stays
+        # bound to the test file's session state.
+        function New-SequenceRunners {
+            param([string[]]$Phases)
+            $script:seqCounts = @{}
+            $table = @{}
+            foreach ($phase in $Phases) {
+                $script:seqCounts[$phase] = 0
+                $table[$phase] = Invoke-Expression ('{ $script:seqCounts[''' + $phase + ''']++; return $true }')
+            }
+            return $table
+        }
+        $script:seqPhases = @('Drivers', 'Applications', 'WorkflowSpecifics', 'WindowsUpdate',
+            'Activation', 'FinalValidation', 'BootEntryRegistration')
+    }
+    BeforeEach {
+        $script:sroot = New-MockPartition -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('orch-seq-' + [guid]::NewGuid().ToString('N')))
+        $log = New-RunLog -Root (Join-Path $script:sroot 'Logs') -RunType 'InitialDeployment'
+        Add-LogEvent -Log $log -Event 'SuiteFixture'
+        $script:srootEvents = $log.EventsPath
+        $script:srootStatePath = Join-Path $script:sroot 'State\DeploymentState.json'
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+    }
+    AfterEach {
+        Remove-Item -Recurse -Force $script:sroot -ErrorAction SilentlyContinue
+    }
+    It 'walks every phase exactly once in PHASE_ORDER, records Result and CompletedUtc, and retains recovery content' {
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'Completed'
+        $r.Completed | Should -BeTrue
+        $r.Result | Should -Be 'Completed'
+        # Every scripted phase ran exactly once (LogFinalization and Cleanup
+        # ran through their default wiring).
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 1 }
+        # The checkpoint walks the FULL sequence: each phase exactly once, in
+        # order, no duplicates and no gaps.
+        $rp = Get-ResumePoint -Path $script:srootStatePath
+        (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup'
+        foreach ($phase in (Get-PhaseOrder)) {
+            @(@($rp.CompletedPhases) | Where-Object { $_ -eq $phase }).Count | Should -Be 1
+        }
+        $after = Read-JsonFile -Path $script:srootStatePath
+        $after.Result | Should -Be 'Completed'
+        # CompletedUtc as an ISO 8601 UTC string, asserted on the raw file
+        # text (pwsh 7 auto-types ISO strings; Task 16 note), never hardcoded.
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+        # Recovery content is retained through completion (Q89): the verified
+        # run log survived cleanup too.
+        foreach ($retained in @(
+            'Sources\Orchestrator\Part1.psm1',
+            'Sources\Apps\EZT\manifest.json',
+            'Sources\Apps\MMC\manifest.json',
+            'Sources\Drivers\Asus\PRIME\Chipset\AsusSetup.exe',
+            'Sources\Drivers\Gigabyte\B650\LAN\installer.exe',
+            'Sources\Config\effective-config.json',
+            'ImageCache',
+            'State\FactoryProfile.json',
+            'State\FactoryProfile.lastknowngood.json',
+            'State\ReadinessRecord.json',
+            'Logs')) {
+            Test-Path -LiteralPath (Join-Path $script:sroot $retained) | Should -BeTrue
+        }
+        Test-Path -LiteralPath $script:srootEvents | Should -BeTrue
+    }
+    It 'resumes a mid-sequence power loss by invoking ONLY the incomplete phase action (zero already-completed re-invocations)' {
+        $marker = Join-Path ([System.IO.Path]::GetTempPath()) ('orch-crash-' + [guid]::NewGuid().ToString('N') + '.txt')
+        try {
+            # Leg 1: a CHILD PROCESS runs the real sequence and is hard-killed
+            # (SIGKILL: no finally blocks, no mutex release) inside the FIRST
+            # WindowsUpdate action invocation. Probed on this host: the named
+            # mutex dies with the process, so the next entry acquires cleanly
+            # - the checkpoint FILE is the only thing that survives.
+            $child = {
+                param($ModulePath, $PartitionRoot, $MarkerPath)
+                Import-Module $ModulePath -Force
+                $runners = @{
+                    Drivers           = { return $true }.GetNewClosure()
+                    Applications      = { return $true }.GetNewClosure()
+                    WorkflowSpecifics = { return $true }.GetNewClosure()
+                    WindowsUpdate     = {
+                        Add-Content -Path $MarkerPath -Value 'crash'
+                        Stop-Process -Id $PID -Force
+                        return $true
+                    }.GetNewClosure()
+                }
+                $null = Invoke-DeploymentSequence -PartitionRoot $PartitionRoot -PhaseRunners $runners
+            }
+            $job = Start-Job -ScriptBlock $child -ArgumentList $script:modulePath, $script:sroot, $marker
+            $deadline = (Get-Date).AddSeconds(120)
+            while (-not (Test-Path -LiteralPath $marker) -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 200
+            }
+            Test-Path -LiteralPath $marker | Should -BeTrue
+            Start-Sleep -Seconds 2
+            try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
+            # The crashed checkpoint, read back from the FILE only: everything
+            # before the crash completed, the in-flight attempt is recorded,
+            # and the pre-delegation reboot marker is durable.
+            $rp = Get-ResumePoint -Path $script:srootStatePath
+            (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics'
+            $rp.Phase | Should -Be 'WindowsUpdate'
+            $rp.Attempt | Should -Be 1
+            $rp.RebootPending | Should -BeTrue
+            # Leg 2: this process never entered (BeforeEach reset it AFTER the
+            # previous test and BEFORE the child ran). Fresh context, file-only
+            # state, counting runners - the Scheduled Task re-entry shape.
+            $runners2 = New-SequenceRunners -Phases $script:seqPhases
+            $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+            $r2.Outcome | Should -Be 'Completed'
+            $r2.Result | Should -Be 'Completed'
+            # ZERO already-completed actions re-invoked; the incomplete phase
+            # and everything after it ran exactly once each.
+            foreach ($done in @('Drivers', 'Applications', 'WorkflowSpecifics')) {
+                $script:seqCounts[$done] | Should -Be 0
+            }
+            foreach ($fresh in @('WindowsUpdate', 'Activation', 'FinalValidation', 'BootEntryRegistration')) {
+                $script:seqCounts[$fresh] | Should -Be 1
+            }
+            $final = Get-ResumePoint -Path $script:srootStatePath
+            (@($final.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration,LogFinalization,Cleanup'
+            ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+        }
+        finally {
+            Remove-Item -Force $marker -ErrorAction SilentlyContinue
+        }
+    }
+    It 'returns RebootPending with the phase when an action requests a restart, and re-entry completes without re-invoking completed phases' {
+        $runners = New-SequenceRunners -Phases @('Drivers', 'Applications', 'WorkflowSpecifics')
+        $script:seqWu = 0
+        # Plain scriptblock (no closure): $script:seqWu must resolve against
+        # THIS test file's script scope when the module invokes the action.
+        $runners['WindowsUpdate'] = { $script:seqWu++; Set-OrchestrationRestartRequested; return $true }
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'RebootPending'
+        $r.Phase | Should -Be 'WindowsUpdate'
+        $r.Completed | Should -BeFalse
+        $script:seqWu | Should -Be 1
+        # The restart-requesting phase itself is COMPLETE and the marker is
+        # durable while the restart is outstanding (Q35).
+        $rp = Get-ResumePoint -Path $script:srootStatePath
+        (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate'
+        $rp.RebootPending | Should -BeTrue
+        # Simulated restart: fresh module, file-only state; the Scheduled Task
+        # at next boot re-enters the sequence.
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+        $runners2 = New-SequenceRunners -Phases $script:seqPhases
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+        $r2.Outcome | Should -Be 'Completed'
+        $r2.Result | Should -Be 'Completed'
+        foreach ($done in @('Drivers', 'Applications', 'WorkflowSpecifics', 'WindowsUpdate')) {
+            $script:seqCounts[$done] | Should -Be 0
+        }
+        foreach ($fresh in @('Activation', 'FinalValidation', 'BootEntryRegistration')) {
+            $script:seqCounts[$fresh] | Should -Be 1
+        }
+    }
+    It 'stops the sequence at BootEntryRegistration review when the boot entry is Blocked (default action, fail closed)' {
+        # The completion footprint is staged to prove a blocked boot entry
+        # stops the sequence BEFORE completion: nothing later may run.
+        Write-AtomicJson -Path (Join-Path $script:sroot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        New-Item -ItemType Directory -Path (Join-Path $script:sroot 'OrchestratorRuntime') -Force | Out-Null
+        # BootEntryRegistration deliberately NOT overridden: the default
+        # action runs the real bcdedit-based tool, which on this non-Windows
+        # suite host (and on any host without a registered healthy entry)
+        # fails visible and reports Blocked.
+        $phases = @('Drivers', 'Applications', 'WorkflowSpecifics', 'WindowsUpdate', 'Activation', 'FinalValidation')
+        $runners = New-SequenceRunners -Phases $phases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Phase | Should -Be 'BootEntryRegistration'
+        $r.Completed | Should -BeFalse
+        $rp = Get-ResumePoint -Path $script:srootStatePath
+        (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation'
+        $after = Read-JsonFile -Path $script:srootStatePath
+        $after.Result | Should -BeNullOrEmpty
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Not -Match 'CompletedUtc'
+        # The phases before the block ran once; LogFinalization and Cleanup
+        # never ran, and the completion footprint survived untouched.
+        foreach ($phase in $phases) { $script:seqCounts[$phase] | Should -Be 1 }
+        Test-Path -LiteralPath (Join-Path $script:sroot 'State\TaskRegistration.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:sroot 'OrchestratorRuntime') | Should -BeTrue
+    }
+    It 'stops at LogFinalization review when the run log fails verification (the Q73 gate closes BEFORE cleanup)' {
+        Write-AtomicJson -Path (Join-Path $script:sroot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        New-Item -ItemType Directory -Path (Join-Path $script:sroot 'OrchestratorRuntime') -Force | Out-Null
+        # LogFinalization deliberately NOT overridden: the default action
+        # verifies the CURRENT run log, and the staged log is corrupt.
+        [System.IO.File]::AppendAllText($script:srootEvents, 'this line is not json' + [Environment]::NewLine, [System.Text.Encoding]::ASCII)
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'TechnicianReview'
+        $r.Phase | Should -Be 'LogFinalization'
+        $rp = Get-ResumePoint -Path $script:srootStatePath
+        (@($rp.CompletedPhases) -join ',') | Should -Be 'Drivers,Applications,WorkflowSpecifics,WindowsUpdate,Activation,FinalValidation,BootEntryRegistration'
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Not -Match 'CompletedUtc'
+        # The summary gate closed BEFORE the cleanup phase ran: the
+        # completion footprint survived.
+        Test-Path -LiteralPath (Join-Path $script:sroot 'State\TaskRegistration.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:sroot 'OrchestratorRuntime') | Should -BeTrue
+    }
+    It 'returns the blocked completion shape when Complete-Deployment blocks, and a retry completes with zero phase re-invocations' {
+        # A directory squatting the marker path makes cleanup fail closed.
+        New-Item -ItemType Directory -Path (Join-Path $script:sroot 'State\TaskRegistration.json\Squat') -Force | Out-Null
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'Blocked'
+        $r.Phase | Should -Be 'Cleanup'
+        $r.Completed | Should -BeFalse
+        $r.BlockedBy | Should -Be 'CleanupFailure'
+        $after = Read-JsonFile -Path $script:srootStatePath
+        $after.Result | Should -BeNullOrEmpty
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Not -Match 'CompletedUtc'
+        # The technician clears the obstruction; the next task start re-enters.
+        Remove-Item -Recurse -Force (Join-Path $script:sroot 'State\TaskRegistration.json')
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+        $runners2 = New-SequenceRunners -Phases $script:seqPhases
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+        $r2.Outcome | Should -Be 'Completed'
+        $r2.Result | Should -Be 'Completed'
+        # Every phase was already recorded complete: zero re-invocations.
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        $final = Read-JsonFile -Path $script:srootStatePath
+        $final.Result | Should -Be 'Completed'
+        # No stale block record on the final document.
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Not -Match 'CleanupFailure'
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+    }
+    It 'a post-completion restart re-enters, skips every phase, and performs cleanup only' {
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $first = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $first.Outcome | Should -Be 'Completed'
+        # A post-completion restart finds a freshly staged completion
+        # footprint; the re-entry must remove it and touch nothing else.
+        Write-AtomicJson -Path (Join-Path $script:sroot 'State\TaskRegistration.json') -Value @{
+            TaskName       = 'OSDeploy Orchestrator'
+            RegisteredUtc  = [datetime]::UtcNow.ToString('o')
+        }
+        $m = Get-OrchestratorMutex
+        if ($null -ne $m) {
+            try { $m.ReleaseMutex() } catch { }
+            try { $m.Dispose() } catch { }
+        }
+        Import-Module $script:modulePath -Force
+        $runners2 = New-SequenceRunners -Phases $script:seqPhases
+        $r2 = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners2
+        $r2.Outcome | Should -Be 'PostCompletionRestart'
+        $r2.Completed | Should -BeTrue
+        $r2.Ok | Should -BeTrue
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        Test-Path -LiteralPath (Join-Path $script:sroot 'State\TaskRegistration.json') | Should -BeFalse
+        $final = Read-JsonFile -Path $script:srootStatePath
+        $final.Result | Should -Be 'Completed'
+        ([System.IO.File]::ReadAllText($script:srootStatePath)) | Should -Match '"CompletedUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z"'
+    }
+    It 'throws on an unknown phase name or a non-scriptblock runner in PhaseRunners (fail closed, before any entry)' {
+        Get-OrchestratorMutex | Should -BeNullOrEmpty
+        $typo = @{ NotAPhase = { return $true } }
+        { Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $typo } | Should -Throw
+        $bad = @{ Drivers = 'not a scriptblock' }
+        { Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $bad } | Should -Throw
+        # The validation path never acquired the single-instance lock.
+        Get-OrchestratorMutex | Should -BeNullOrEmpty
+    }
+    It 'a second instance exits without any phase work or state mutation' {
+        $entry = Enter-Orchestrator -PartitionRoot $script:sroot
+        $entry.Ran | Should -BeTrue
+        $runners = New-SequenceRunners -Phases $script:seqPhases
+        $before = (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash
+        $r = Invoke-DeploymentSequence -PartitionRoot $script:sroot -PhaseRunners $runners
+        $r.Outcome | Should -Be 'SecondInstance'
+        $r.Completed | Should -BeFalse
+        $r.Result | Should -BeNullOrEmpty
+        foreach ($phase in $script:seqPhases) { $script:seqCounts[$phase] | Should -Be 0 }
+        (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
+    }
+}
