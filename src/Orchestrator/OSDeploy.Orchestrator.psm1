@@ -3426,3 +3426,267 @@ function Invoke-DeploymentSequence {
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Windows-only staging mechanics (Task 28): the NTFS ACL restriction for the
+# orchestrator runtime directory and the SYSTEM startup Scheduled Task
+# registration the installed-Windows host needs. Both are staging-time
+# mechanics: they run where the OSDCloud Deployment Partition is prepared or
+# in installed Windows, never on the PXE bootstrap.
+#
+# Platform contract (identical for all three functions): when the host is not
+# Windows ([System.Environment]::OSVersion.Platform -ne 'Win32NT'; $IsWindows
+# does not exist in Windows PowerShell 5.1), the function writes ONE warning
+# naming the function and 'Windows only' and returns without throwing, so the
+# unit suites stay green on the Linux development host. The internal
+# -SkipNoop switch bypasses that branch so the Windows code path is directly
+# testable; on a non-Windows host it fails VISIBLE (fail closed, never a
+# silent pass). Windows-only cmdlets (Get-Acl/Set-Acl,
+# New-ScheduledTask*/Register-ScheduledTask/Unregister-ScheduledTask/
+# Get-ScheduledTask) are resolved ONLY inside the function bodies at call
+# time - never at import time - so module import stays clean on hosts where
+# those cmdlets do not exist.
+#
+# Q91 boundary: every path parameter is a LOCAL path. A UNC path
+# ('\\server\share\...') throws before any work; no function here names,
+# accepts, or probes DeploymentShare or any deployment server.
+# ---------------------------------------------------------------------------
+
+function Set-OrchestratorAcl {
+    <#
+        .SYNOPSIS
+        Restricts one local directory's NTFS ACL to exactly SYSTEM and local
+        Administrators, inheritance disabled.
+
+        .DESCRIPTION
+        Staging-time Windows mechanic for the orchestrator runtime directory
+        (the deployed C:\ProgramData\OSDeploy\Orchestrator). The directory
+        DACL is replaced with exactly two Allow FullControl rules - NT
+        AUTHORITY\SYSTEM (S-1-5-18) and BUILTIN\Administrators
+        (S-1-5-32-544), addressed by well-known SID so a locale-specific
+        account name can never break the restriction - and inheritance is
+        disabled (SetAccessRuleProtection), so the directory keeps only what
+        this function grants. Fail closed: after Set-Acl the STORED ACL is
+        re-read and verified (inheritance disabled, exactly two rules, both
+        identities present, both Allow FullControl); any mismatch throws - an
+        ACL failure never surfaces as a silent success.
+
+        Windows only; see the section banner above for the no-op warning /
+        -SkipNoop contract. Q91: -Directory must be a LOCAL path; a UNC path
+        throws before any ACL work.
+
+        Returns @{ Ok; Directory; Identities } on success and throws on every
+        failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [switch]$SkipNoop
+    )
+    if (-not $SkipNoop -and [System.Environment]::OSVersion.Platform -ne 'Win32NT') {
+        Write-Warning ("Set-OrchestratorAcl: Windows only; no ACL work was performed on host platform '{0}'." -f [System.Environment]::OSVersion.Platform)
+        return
+    }
+    if ($Directory.StartsWith('\\')) {
+        throw ("Set-OrchestratorAcl: -Directory must be a local path; the UNC path '{0}' is never accepted (Q91: no DeploymentShare or server path)." -f $Directory)
+    }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw ("Set-OrchestratorAcl: -Directory '{0}' is not an existing directory." -f $Directory)
+    }
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    # Get-Acl/Set-Acl exist only on Windows: they are resolved here, inside
+    # the guarded body, never at import time.
+    $acl = Get-Acl -LiteralPath $Directory
+    # Disable inheritance and DROP the inherited rules: nothing the
+    # directory inherited survives the restriction.
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existing in @($acl.Access)) {
+        $null = $acl.RemoveAccessRule($existing)
+    }
+    foreach ($sid in @($systemSid, $adminsSid)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Directory -AclObject $acl
+    # Fail-closed verification: prove the restriction is what the DIRECTORY
+    # now stores, never trust Set-Acl's quiet return.
+    $stored = Get-Acl -LiteralPath $Directory
+    if (-not $stored.AreAccessRulesProtected) {
+        throw ("Set-OrchestratorAcl: inheritance is still enabled on '{0}' after the ACL write." -f $Directory)
+    }
+    $entries = @($stored.Access)
+    if ($entries.Count -ne 2) {
+        throw ("Set-OrchestratorAcl: the stored ACL on '{0}' has {1} access rules; exactly 2 (SYSTEM, Administrators) are required." -f $Directory, $entries.Count)
+    }
+    $storedSids = @()
+    foreach ($entry in $entries) {
+        $identity = $entry.IdentityReference
+        if ($identity -is [System.Security.Principal.SecurityIdentifier]) {
+            $storedSids += $identity.Value
+        }
+        else {
+            $storedSids += [string]$identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        if ($entry.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            throw ("Set-OrchestratorAcl: the stored rule for '{0}' on '{1}' is not an Allow rule." -f $identity.Value, $Directory)
+        }
+        if (($entry.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+            throw ("Set-OrchestratorAcl: the stored rule for '{0}' on '{1}' does not grant FullControl." -f $identity.Value, $Directory)
+        }
+    }
+    if ($storedSids -notcontains 'S-1-5-18' -or $storedSids -notcontains 'S-1-5-32-544') {
+        throw ("Set-OrchestratorAcl: the stored ACL on '{0}' does not carry exactly SYSTEM and Administrators (found: {1})." -f $Directory, ($storedSids -join ', '))
+    }
+    return @{ Ok = $true; Directory = $Directory; Identities = @('S-1-5-18', 'S-1-5-32-544') }
+}
+
+function Register-OrchestratorTask {
+    <#
+        .SYNOPSIS
+        Registers the SYSTEM startup Scheduled Task and writes its partition
+        registration marker.
+
+        .DESCRIPTION
+        Staging-time Windows mechanic: registers the orchestrator's SYSTEM
+        startup Scheduled Task, the Q35/Q36 reboot re-entry host. Principal:
+        UserId SYSTEM, LogonType ServiceAccount, RunLevel Highest - a service
+        account boot task needs NO user sign-in and stores no password.
+        Trigger: AtStartup. Multiple-instance policy: IgnoreNew, so an
+        overlapping start never launches a second concurrent orchestrator
+        (the scheduled-task side of the single-instance contract; the mutex
+        inside Enter-Orchestrator is the second side). The -Execute /
+        -Argument defaults describe the installed-Windows host wiring (the
+        entry wrapper the host places in the runtime directory); callers
+        override both - the component suite does, to point the task at a
+        probe.
+
+        Fail closed: after Register-ScheduledTask the task is re-fetched
+        with Get-ScheduledTask and its principal, logon type, run level,
+        instance policy, and boot trigger are VERIFIED; any mismatch throws.
+        Only after that verification is the registration marker
+        <PartitionRoot>\State\TaskRegistration.json written (atomic,
+        TaskName + RegisteredUtc) - the exact file Invoke-Cleanup removes at
+        completion, so a marked partition always has the verified task and
+        the two paths can never drift apart. A missing partition root or
+        State directory throws (staging error; state is never invented).
+
+        Windows only; see the section banner above for the no-op warning /
+        -SkipNoop contract. Q91: -PartitionRoot must be a LOCAL partition
+        path; a UNC path throws before any registration work.
+
+        Returns @{ Ok; TaskName; MarkerPath } on success and throws on every
+        failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PartitionRoot,
+        [string]$TaskName = 'OSDeploy Orchestrator',
+        [string]$Execute = 'powershell.exe',
+        [string]$Argument = '-NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\OSDeploy\Orchestrator\Start-Orchestrator.ps1"',
+        [switch]$SkipNoop
+    )
+    if (-not $SkipNoop -and [System.Environment]::OSVersion.Platform -ne 'Win32NT') {
+        Write-Warning ("Register-OrchestratorTask: Windows only; no Scheduled Task was registered on host platform '{0}'." -f [System.Environment]::OSVersion.Platform)
+        return
+    }
+    if ($PartitionRoot.StartsWith('\\')) {
+        throw ("Register-OrchestratorTask: -PartitionRoot must be a local partition path; the UNC path '{0}' is never accepted (Q91: no DeploymentShare or server path)." -f $PartitionRoot)
+    }
+    if (-not (Test-Path -LiteralPath $PartitionRoot -PathType Container)) {
+        throw ("Register-OrchestratorTask: -PartitionRoot '{0}' does not exist; the OSDCloud Deployment Partition must be staged first." -f $PartitionRoot)
+    }
+    $stateDir = Join-Path $PartitionRoot 'State'
+    if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) {
+        throw ("Register-OrchestratorTask: the State directory does not exist under '{0}'; the OSDCloud Deployment Partition must be staged first." -f $PartitionRoot)
+    }
+    # New-ScheduledTask*/Register-ScheduledTask/Get-ScheduledTask exist only
+    # on Windows: they are resolved here, inside the guarded body, never at
+    # import time.
+    $action = New-ScheduledTaskAction -Execute $Execute -Argument $Argument
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+    # -Force: re-registration at re-staging overwrites a prior task of the
+    # same name instead of failing on the second staging pass.
+    $null = Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop
+    # Fail-closed verification: the registered task must exist with EXACTLY
+    # the contract above before success (and the marker) can be reported.
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    if ($null -eq $task) {
+        throw ("Register-OrchestratorTask: task '{0}' was not found after registration." -f $TaskName)
+    }
+    $principalId = [string]$task.Principal.UserId
+    if ($principalId -ine 'SYSTEM' -and $principalId -ine 'NT AUTHORITY\SYSTEM') {
+        throw ("Register-OrchestratorTask: task '{0}' principal is '{1}', expected SYSTEM." -f $TaskName, $principalId)
+    }
+    if ([string]$task.Principal.LogonType -ine 'ServiceAccount') {
+        throw ("Register-OrchestratorTask: task '{0}' logon type is '{1}', expected ServiceAccount." -f $TaskName, [string]$task.Principal.LogonType)
+    }
+    if ([string]$task.Principal.RunLevel -ine 'Highest') {
+        throw ("Register-OrchestratorTask: task '{0}' run level is '{1}', expected Highest." -f $TaskName, [string]$task.Principal.RunLevel)
+    }
+    if ([string]$task.Settings.MultipleInstances -ine 'IgnoreNew') {
+        throw ("Register-OrchestratorTask: task '{0}' multiple-instance policy is '{1}', expected IgnoreNew." -f $TaskName, [string]$task.Settings.MultipleInstances)
+    }
+    $bootTriggers = @($task.Triggers | Where-Object { [string]$_.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger' })
+    if ($bootTriggers.Count -lt 1) {
+        throw ("Register-OrchestratorTask: task '{0}' has no boot (startup) trigger." -f $TaskName)
+    }
+    $markerPath = Join-Path $stateDir 'TaskRegistration.json'
+    Write-AtomicJson -Path $markerPath -Value @{
+        TaskName      = $TaskName
+        RegisteredUtc = [datetime]::UtcNow.ToString('o')
+    }
+    return @{ Ok = $true; TaskName = $TaskName; MarkerPath = $markerPath }
+}
+
+function Unregister-OrchestratorTask {
+    <#
+        .SYNOPSIS
+        Removes the orchestrator Scheduled Task; idempotent and safe to call
+        twice.
+
+        .DESCRIPTION
+        The retire-side counterpart of Register-OrchestratorTask: unregisters
+        the named Scheduled Task and then VERIFIES with Get-ScheduledTask
+        that it is gone; a task still present after Unregister-ScheduledTask
+        throws (fail closed). When the task does not exist the call is a
+        SUCCESS no-op (Existed = $false) - safe to call twice, or on a
+        machine whose task was never registered or already retired. The
+        partition registration MARKER is deliberately NOT touched here:
+        marker removal is Invoke-Cleanup's single responsibility, so
+        registration and cleanup can never drift apart.
+
+        Windows only; see the section banner above for the no-op warning /
+        -SkipNoop contract.
+
+        Returns @{ Ok; TaskName; Existed } on success and throws on every
+        failure.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TaskName = 'OSDeploy Orchestrator',
+        [switch]$SkipNoop
+    )
+    if (-not $SkipNoop -and [System.Environment]::OSVersion.Platform -ne 'Win32NT') {
+        Write-Warning ("Unregister-OrchestratorTask: Windows only; no Scheduled Task was removed on host platform '{0}'." -f [System.Environment]::OSVersion.Platform)
+        return
+    }
+    # Get-ScheduledTask/Unregister-ScheduledTask exist only on Windows: they
+    # are resolved here, inside the guarded body, never at import time.
+    $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $existing) {
+        return @{ Ok = $true; TaskName = $TaskName; Existed = $false }
+    }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    $after = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -ne $after) {
+        throw ("Unregister-OrchestratorTask: task '{0}' is still present after unregistration." -f $TaskName)
+    }
+    return @{ Ok = $true; TaskName = $TaskName; Existed = $true }
+}

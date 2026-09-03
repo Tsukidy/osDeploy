@@ -2922,3 +2922,103 @@ Describe 'Invoke-DeploymentSequence phase sequence conductor (Q35/Q36/Q89)' {
         (Get-FileHash -LiteralPath $script:srootStatePath -Algorithm SHA256).Hash | Should -Be $before
     }
 }
+
+Describe 'Windows-only mechanics no-op contract (Task 28)' {
+    BeforeAll {
+        # The three Windows-only staging mechanics assert their NON-WINDOWS
+        # contract here: without -SkipNoop each writes one warning naming the
+        # function and 'Windows only', returns null, and never throws - so
+        # this suite stays green on the Linux development host - while
+        # -SkipNoop (internal) reaches the real Windows branch and fails
+        # VISIBLE on this host (Get-Acl / New-ScheduledTask* do not exist on
+        # non-Windows pwsh; fail closed, never a silent pass). On a Windows
+        # host every It below skips: the real bodies are the component
+        # suite's job (tests/component/ComponentSuite.ps1), EXCEPT the Q91
+        # UNC-rejection Its, which are platform-independent validation.
+        $script:onWindowsHost = [System.Environment]::OSVersion.Platform -eq 'Win32NT'
+    }
+    It 'Set-OrchestratorAcl no-ops with a written Windows-only warning and no output when not on Windows' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows no-op path; the Windows body is the component suite job' }
+        $dir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('acl-' + [guid]::NewGuid().ToString('N')))
+        try {
+            $result = 'sentinel'
+            $warnings = @()
+            $threw = $false
+            try { $result = Set-OrchestratorAcl -Directory $dir.FullName -WarningVariable warnings } catch { $threw = $true }
+            $threw | Should -BeFalse
+            @($warnings).Count | Should -BeGreaterOrEqual 1
+            ($warnings -join ' ') | Should -Match 'Set-OrchestratorAcl'
+            ($warnings -join ' ') | Should -Match 'Windows only'
+            $result | Should -BeNullOrEmpty
+        }
+        finally { Remove-Item -Recurse -Force $dir.FullName -ErrorAction SilentlyContinue }
+    }
+    It 'Register-OrchestratorTask no-ops with a written Windows-only warning and writes no marker when not on Windows' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows no-op path; the Windows body is the component suite job' }
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ('reg-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path $root 'State') -Force | Out-Null
+        try {
+            $result = 'sentinel'
+            $warnings = @()
+            $threw = $false
+            try { $result = Register-OrchestratorTask -PartitionRoot $root -WarningVariable warnings } catch { $threw = $true }
+            $threw | Should -BeFalse
+            @($warnings).Count | Should -BeGreaterOrEqual 1
+            ($warnings -join ' ') | Should -Match 'Register-OrchestratorTask'
+            ($warnings -join ' ') | Should -Match 'Windows only'
+            $result | Should -BeNullOrEmpty
+            # The no-op branch returns before ANY filesystem side effect.
+            Test-Path -LiteralPath (Join-Path $root 'State\TaskRegistration.json') | Should -BeFalse
+        }
+        finally { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+    }
+    It 'Unregister-OrchestratorTask no-ops with a written Windows-only warning and no output when not on Windows' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows no-op path; the Windows body is the component suite job' }
+        $result = 'sentinel'
+        $warnings = @()
+        $threw = $false
+        try { $result = Unregister-OrchestratorTask -WarningVariable warnings } catch { $threw = $true }
+        $threw | Should -BeFalse
+        @($warnings).Count | Should -BeGreaterOrEqual 1
+        ($warnings -join ' ') | Should -Match 'Unregister-OrchestratorTask'
+        ($warnings -join ' ') | Should -Match 'Windows only'
+        $result | Should -BeNullOrEmpty
+    }
+    It 'Set-OrchestratorAcl -SkipNoop reaches the Windows branch and fails visibly on a non-Windows host' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows fail-visible path; the Windows body is the component suite job' }
+        $dir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('acl-skip-' + [guid]::NewGuid().ToString('N')))
+        try {
+            # Get-Acl does not exist on non-Windows pwsh: the guarded body
+            # must surface that failure, never swallow it into success.
+            { Set-OrchestratorAcl -Directory $dir.FullName -SkipNoop } | Should -Throw
+        }
+        finally { Remove-Item -Recurse -Force $dir.FullName -ErrorAction SilentlyContinue }
+    }
+    It 'Register-OrchestratorTask -SkipNoop reaches the Windows branch and fails visibly on a non-Windows host' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows fail-visible path; the Windows body is the component suite job' }
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ('reg-skip-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path $root 'State') -Force | Out-Null
+        try {
+            # The partition fixture is valid, so the guarded body is reached
+            # and New-ScheduledTaskAction's absence surfaces as a throw -
+            # and no marker may be written on that failure path.
+            { Register-OrchestratorTask -PartitionRoot $root -SkipNoop } | Should -Throw
+            Test-Path -LiteralPath (Join-Path $root 'State\TaskRegistration.json') | Should -BeFalse
+        }
+        finally { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+    }
+    It 'Unregister-OrchestratorTask -SkipNoop reaches the Windows branch and fails visibly on a non-Windows host' {
+        if ($script:onWindowsHost) { Set-ItResult -Skipped -Because 'this It asserts the non-Windows fail-visible path; the Windows body is the component suite job' }
+        { Unregister-OrchestratorTask -SkipNoop } | Should -Throw
+    }
+    It 'Set-OrchestratorAcl rejects a UNC directory path before any ACL work (Q91 boundary)' {
+        # Platform-independent validation: the UNC guard sits after the
+        # no-op guard, so -SkipNoop reaches it on every host.
+        $err = { Set-OrchestratorAcl -Directory '\\deployment\DeploymentShare\runtime' -SkipNoop } | Should -Throw -PassThru
+        $err.Exception.Message | Should -Match 'UNC'
+    }
+    It 'Register-OrchestratorTask rejects a UNC partition path before any registration work (Q91 boundary)' {
+        $err = { Register-OrchestratorTask -PartitionRoot '\\deployment\DeploymentShare' -SkipNoop } | Should -Throw -PassThru
+        $err.Exception.Message | Should -Match 'UNC'
+    }
+}
